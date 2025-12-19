@@ -117,13 +117,16 @@
 2. **Rust依存関係の追加** (`src-tauri/Cargo.toml`)
    ```toml
    [dependencies]
-   tauri = { version = "2.0", features = ["fs-all", "dialog-all"] }
+   tauri = { version = "2.0", features = [] }
+   tauri-plugin-dialog = "2.0"
    serde = { version = "1.0", features = ["derive"] }
    serde_json = "1.0"
    lopdf = "0.32"
    image = "0.24"
    anyhow = "1.0"
    ```
+   
+   **注意**: Tauri 2.xでは機能フラグが変更され、プラグインシステムを使用します。
 
 3. **依存関係のインストール確認**
    ```bash
@@ -202,15 +205,21 @@
 
 **手順**:
 
-1. **Tauriコマンドの実装** (`src-tauri/src/commands/mod.rs`)
+1. **Tauriプラグインの追加** (`src-tauri/Cargo.toml`)
+   ```toml
+   [dependencies]
+   tauri-plugin-dialog = "2.0"
+   ```
+
+2. **Tauriコマンドの実装** (`src-tauri/src/commands/mod.rs`)
    ```rust
    use tauri::command;
+   use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
    #[command]
-   pub async fn open_file_dialog() -> Result<Option<String>, String> {
-       use tauri::api::dialog::FileDialogBuilder;
-       
-       let file_path = FileDialogBuilder::new()
+   pub async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
+       let file_path = app.dialog()
+           .file()
            .add_filter("PDF", &["pdf"])
            .pick_file()
            .await;
@@ -218,23 +227,27 @@
        Ok(file_path.map(|p| p.to_string_lossy().to_string()))
    }
    ```
+   
+   **注意**: Tauri 2.xでは`tauri-plugin-dialog`を使用します。実装前に[公式ドキュメント](https://v2.tauri.app/develop/plugin/)を確認してください。
 
-2. **コマンドの登録** (`src-tauri/src/main.rs`)
+3. **プラグインとコマンドの登録** (`src-tauri/src/main.rs`)
    ```rust
    mod commands;
    use commands::open_file_dialog;
+   use tauri_plugin_dialog::init;
 
    fn main() {
        tauri::Builder::default()
+           .plugin(init())
            .invoke_handler(tauri::generate_handler![open_file_dialog])
            .run(tauri::generate_context!())
            .expect("error while running tauri application");
    }
    ```
 
-3. **フロントエンドでの使用** (`src/App.tsx`)
+4. **フロントエンドでの使用** (`src/App.tsx`)
    ```typescript
-   import { invoke } from '@tauri-apps/api/tauri';
+   import { invoke } from '@tauri-apps/api/core';
 
    function App() {
      const handleOpenFile = async () => {
@@ -260,8 +273,10 @@
    }
    ```
 
-4. **動作確認**
+5. **動作確認**
    - ボタンをクリックしてファイル選択ダイアログが開くことを確認
+   
+**注意**: Tauri 2.xではAPIが変更されています。実装前に[公式ドキュメント](https://v2.tauri.app/)を必ず確認してください。
 
 **確認事項**:
 - [ ] ファイル選択ダイアログが開く
@@ -545,8 +560,16 @@
    ```typescript
    import * as pdfjsLib from 'pdfjs-dist';
 
-   // PDF.jsのワーカーを設定
-   pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+   // PDF.jsのワーカーを設定（最新の推奨方法）
+   if (typeof window !== 'undefined') {
+     pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+       'pdfjs-dist/build/pdf.worker.min.js',
+       import.meta.url
+     ).toString();
+   }
+   
+   // またはCDNを使用する場合
+   // pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
    export const loadPdf = async (filePath: string) => {
      const loadingTask = pdfjsLib.getDocument(filePath);
@@ -920,13 +943,13 @@
 1. **保存ダイアログの実装** (`src-tauri/src/commands/file_saver.rs`)
    ```rust
    use tauri::command;
+   use tauri_plugin_dialog::DialogExt;
    use std::fs;
 
    #[command]
-   pub async fn save_file_dialog() -> Result<Option<String>, String> {
-       use tauri::api::dialog::FileDialogBuilder;
-       
-       let file_path = FileDialogBuilder::new()
+   pub async fn save_file_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
+       let file_path = app.dialog()
+           .file()
            .add_filter("PDF", &["pdf"])
            .set_file_name("output.pdf")
            .save_file()
@@ -1374,14 +1397,21 @@
 
 1. **PDF.jsのワーカーエラー**
    - 解決: ワーカーのパスを正しく設定する
+   - Viteを使用する場合、`new URL()`を使用してワーカーパスを解決
 
 2. **Rustのコンパイルエラー**
    - 解決: `cargo check`でエラーを確認し、依存関係を更新
+   - Tauri 2.xではプラグインシステムを使用するため、`tauri-plugin-*`を追加
 
 3. **IPC通信のエラー**
    - 解決: コマンドの登録と型定義を確認
+   - Tauri 2.xでは`@tauri-apps/api/core`を使用
 
-4. **画像が表示されない**
+4. **ファイルダイアログが開かない**
+   - 解決: `tauri-plugin-dialog`が正しく登録されているか確認
+   - `app.dialog()`の使用方法を[公式ドキュメント](https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/dialog)で確認
+
+5. **画像が表示されない**
    - 解決: Base64エンコードとデータ形式を確認
 
 ---

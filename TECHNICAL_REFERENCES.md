@@ -11,9 +11,13 @@
 - **API リファレンス**: https://tauri.app/v1/api/
 - **GitHub**: https://github.com/tauri-apps/tauri
 - **Tauri 2.x ドキュメント**（最新版）: https://v2.tauri.app/
+- **Tauri 2.x ガイド**: https://v2.tauri.app/start/
 - **セットアップガイド**: https://tauri.app/v1/guides/getting-started/prerequisites
 - **IPC通信**: https://tauri.app/v1/guides/features/command
+- **Tauri 2.x IPC通信**: https://v2.tauri.app/develop/command/
 - **ファイルシステムAPI**: https://tauri.app/v1/api/js/fs/
+- **Tauri 2.x プラグイン**: https://v2.tauri.app/develop/plugin/
+- **tauri-plugin-dialog** (Tauri 2.x): https://github.com/tauri-apps/plugins-workspace/tree/v2/plugins/dialog
 
 ### React
 
