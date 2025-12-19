@@ -2,6 +2,9 @@
 
 > Markdown→PDFで「最後にズレるところだけ」を、Word感覚でサクッと直せる、超軽量PDFレイアウト調整ツール
 
+[![GitHub](https://img.shields.io/github/license/Unjuno/miniPDF)](https://github.com/Unjuno/miniPDF)
+[![GitHub](https://img.shields.io/github/stars/Unjuno/miniPDF)](https://github.com/Unjuno/miniPDF)
+
 ## 概要
 
 miniPDF は、Markdown → PDF 変換後に発生するレイアウトの「ズレ」を簡単に修正するための軽量デスクトップアプリケーションです。
@@ -37,7 +40,14 @@ miniPDF は、Markdown → PDF 変換後に発生するレイアウトの「ズ�
 
 ## ライセンス
 
-[ライセンスを決定予定]
+MIT License - 詳細は [LICENSE](./LICENSE) を参照してください。
+
+## コントリビューション
+
+コントリビューションを歓迎します！IssueやPull Requestをお気軽に作成してください。
+
+- [GitHub Issues](https://github.com/Unjuno/miniPDF/issues) - バグ報告・機能要望
+- [GitHub Pull Requests](https://github.com/Unjuno/miniPDF/pulls) - コード貢献
 
 ## ドキュメント
 
