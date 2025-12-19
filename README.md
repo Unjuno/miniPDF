@@ -55,6 +55,7 @@ MIT License - 詳細は [LICENSE](./LICENSE) を参照してください。
 
 - **[CONCEPT.md](./CONCEPT.md)** - プロジェクトのコンセプト・設計思想
 - **[SPECIFICATION.md](./SPECIFICATION.md)** - 機能仕様・実装方法（**実装時の主要参照文書**）
+- **[IMPLEMENTATION_GUIDE.md](./IMPLEMENTATION_GUIDE.md)** - **実装ガイド（Step by Step）** ⭐
 - **[IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)** - 実装計画・技術詳細
 - **[TECHNICAL_REFERENCES.md](./TECHNICAL_REFERENCES.md)** - 技術リファレンス（公式ドキュメントURL）
 
@@ -65,6 +66,7 @@ miniPDF/
 ├── README.md                    # プロジェクト概要（このファイル）
 ├── CONCEPT.md                   # コンセプト文書
 ├── SPECIFICATION.md             # 仕様書（機能仕様・実装方法）
+├── IMPLEMENTATION_GUIDE.md      # 実装ガイド（Step by Step）⭐
 ├── IMPLEMENTATION_PLAN.md       # 実装計画書
 ├── TECHNICAL_REFERENCES.md     # 技術リファレンス
 └── docs/
@@ -77,7 +79,8 @@ miniPDF/
 
 - **プロジェクトの概要を知りたい** → [README.md](./README.md)
 - **設計思想を理解したい** → [CONCEPT.md](./CONCEPT.md)
-- **実装を始める** → [SPECIFICATION.md](./SPECIFICATION.md) **（最重要）**
+- **実装を始める** → [IMPLEMENTATION_GUIDE.md](./IMPLEMENTATION_GUIDE.md) **（Step by Stepガイド）** ⭐
+- **機能仕様を確認したい** → [SPECIFICATION.md](./SPECIFICATION.md)
 - **実装計画を確認したい** → [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)
 - **技術の公式ドキュメントを参照したい** → [TECHNICAL_REFERENCES.md](./TECHNICAL_REFERENCES.md)
 
