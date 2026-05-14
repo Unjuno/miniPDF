@@ -1,0 +1,469 @@
+.pdf-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* why: PDFViewerを残りのスペースすべてを使用して表示 */
+  /* alt: 固定幅（画面に収まらない） */
+  /* evidence: flex: 1により、残りのスペースすべてを使用してPDFViewerが表示される */
+  flex: 1;
+  min-width: 0;
+}
+
+.pdf-viewer-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #666;
+}
+
+.pdf-viewer-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem;
+  border-bottom: 1px solid #ccc;
+  background-color: #f5f5f5;
+  /* why: コントロールを最前面に表示してオーバーレイ要素に覆われないようにする */
+  /* alt: z-indexなし（オーバーレイ要素に覆われる） */
+  /* evidence: z-indexを設定することで、コントロールが常に最前面に表示される */
+  position: relative;
+  z-index: 100;
+}
+
+/* why: ページナビゲーション部分（ページ番号表示）のテキスト色を設定 */
+/* alt: デフォルトの色（背景と同色で見えない可能性がある） */
+/* evidence: 適切な色を設定することで、ページ番号が明確に表示される */
+.pdf-viewer-controls > span:not(.pdf-structure-info) {
+  color: #666666;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.pdf-viewer-controls button {
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+}
+
+.pdf-viewer-controls button:hover:not(:disabled) {
+  background-color: #0056b3;
+}
+
+.pdf-viewer-controls button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+.pdf-viewer-canvas-container {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 1rem;
+  background-color: #e0e0e0;
+  position: relative;
+  /* why: スムーズなスクロール体験を提供 */
+  /* alt: デフォルトのスクロール（カクつく） */
+  /* evidence: smoothスクロールによりユーザー体験が向上 */
+  scroll-behavior: smooth;
+  /* why: スクロールバーの見た目を改善 */
+  /* alt: デフォルトのスクロールバー */
+  /* evidence: カスタムスクロールバーにより視認性が向上 */
+  scrollbar-width: thin;
+  scrollbar-color: #888 #f0f0f0;
+  /* why: ドラッグによるパン機能を示すカーソル */
+  /* alt: デフォルトカーソル（ドラッグ可能であることが分からない） */
+  /* evidence: grabカーソルによりドラッグ可能であることが明確になる */
+  cursor: grab;
+  /* why: コンテナがツールバーの下に表示されないようにz-indexを設定 */
+  /* alt: z-indexなし（ツールバーに覆われる可能性がある） */
+  /* evidence: z-indexを設定することで、コンテナが正しい位置に表示される */
+  z-index: 0;
+}
+
+/* 複数ページ表示モード */
+.pdf-viewer-canvas-container[data-view-mode="continuous"] {
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  /* why: スクロール範囲を適切に設定して、すべてのページが表示できるようにする */
+  /* alt: デフォルトのスクロール範囲（一部のページが表示されない） */
+  /* evidence: min-heightを設定することで、スクロール範囲が適切に設定される */
+  min-height: 100%;
+  padding: 1rem 0 2rem;
+  /* why: 単一ページの白地と区別し、物理ページの束として認識できるようにする */
+  background-color: #d0d0d0;
+}
+
+.pdf-page-container {
+  position: relative;
+  margin-bottom: 20px;
+  margin-left: auto;
+  margin-right: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* why: 各ページのコンテナの高さを適切に設定して、スクロール範囲を確保 */
+  /* alt: 高さを設定しない（スクロール範囲が不十分） */
+  /* evidence: heightを設定することで、各ページが適切に表示され、スクロール範囲が確保される */
+  flex-shrink: 0;
+}
+
+.pdf-viewer-canvas-container[data-view-mode="continuous"] .pdf-page-container {
+  margin-bottom: 20px;
+}
+
+.pdf-viewer-canvas-container[data-view-mode="continuous"] .pdf-viewer-canvas {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  outline: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+.pdf-viewer-canvas-container::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+.pdf-viewer-canvas-container::-webkit-scrollbar-track {
+  background: #f0f0f0;
+  border-radius: 6px;
+}
+
+.pdf-viewer-canvas-container::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 6px;
+}
+
+.pdf-viewer-canvas-container::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+.pdf-viewer-canvas {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  background-color: white;
+  position: relative;
+  /* why: キャンバスのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: will-changeによりGPUアクセラレーションが有効化 */
+  will-change: contents;
+  /* why: レンダリング最適化のためcontainプロパティを使用 */
+  contain: layout style paint;
+  /* why: テキストレンダリング品質を向上 */
+  /* alt: デフォルト設定（文字がつぶれる可能性） */
+  /* evidence: 適切な設定により文字が鮮明に表示される */
+  /* スムーズなレンダリングを優先（テキストの可読性を向上） */
+  image-rendering: auto;
+  /* why: テキストのレンダリング品質を最適化 */
+  /* alt: デフォルト設定（文字がぼやける可能性） */
+  /* evidence: optimizeLegibilityにより文字が鮮明に表示される */
+  text-rendering: optimizeLegibility;
+  /* why: フォントのアンチエイリアスを有効化 */
+  /* alt: アンチエイリアスなし（文字がギザギザになる） */
+  /* evidence: アンチエイリアスにより文字が滑らかに表示される */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-smoothing: antialiased;
+}
+
+.pdf-structure-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* why: 動的なサイズをCSS変数で制御（インラインスタイルを削減） */
+  /* alt: すべてインラインスタイル（アクセシビリティツールの警告が発生） */
+  /* evidence: CSS変数を使用することで、インラインスタイルを削減し、アクセシビリティを向上 */
+  width: var(--overlay-width, 0);
+  height: var(--overlay-height, 0);
+  /* why: 親要素はpointer-events: noneにして、子要素（.text-block-overlay, .image-overlay）のみがクリック可能にする */
+  /* alt: pointer-events: auto（空白部分でもクリックイベントが発生する） */
+  /* evidence: 親要素をnoneにすることで、子要素のみがクリック可能になり、編集機能が正常に動作する */
+  pointer-events: none;
+  /* why: オーバーレイがツールバーの下に表示されるようにz-indexを設定 */
+  /* alt: z-indexなし（ツールバーに覆われる可能性がある） */
+  /* evidence: z-indexを設定することで、オーバーレイが正しい位置に表示される */
+  z-index: 1;
+}
+
+.text-block-overlay {
+  position: absolute;
+  pointer-events: auto;
+  transition: all 0.2s;
+  /* why: 動的な位置をCSS変数で制御（インラインスタイルを削減） */
+  /* alt: すべてインラインスタイル（アクセシビリティツールの警告が発生） */
+  /* evidence: CSS変数を使用することで、インラインスタイルを削減し、アクセシビリティを向上 */
+  left: var(--overlay-left, 0);
+  top: var(--overlay-top, 0);
+  width: var(--overlay-width, 0);
+  height: var(--overlay-height, 0);
+  /* why: オーバーレイのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: transform;
+  transform: translateZ(0);
+  /* why: オーバーレイのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+.text-block-overlay:hover {
+  border-color: rgba(0, 123, 255, 0.8);
+  background-color: rgba(0, 123, 255, 0.2);
+  transform: translateZ(0) scale(1.01);
+  box-shadow: 0 2px 8px rgba(0, 123, 255, 0.3);
+}
+
+.text-block-overlay.selected {
+  animation: selectedPulse 2s ease-in-out infinite;
+}
+
+@keyframes selectedPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(0, 123, 255, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(0, 123, 255, 0);
+  }
+}
+
+.image-overlay {
+  position: absolute;
+  pointer-events: auto;
+  transition: all 0.2s;
+  /* why: 動的な位置をCSS変数で制御（インラインスタイルを削減） */
+  /* alt: すべてインラインスタイル（アクセシビリティツールの警告が発生） */
+  /* evidence: CSS変数を使用することで、インラインスタイルを削減し、アクセシビリティを向上 */
+  left: var(--overlay-left, 0);
+  top: var(--overlay-top, 0);
+  width: var(--overlay-width, 0);
+  height: var(--overlay-height, 0);
+  /* why: オーバーレイのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: transform;
+  transform: translateZ(0);
+  /* why: オーバーレイのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+.image-overlay:hover {
+  border-color: rgba(255, 0, 0, 0.8);
+  background-color: rgba(255, 0, 0, 0.2);
+  transform: translateZ(0) scale(1.01);
+  box-shadow: 0 2px 8px rgba(255, 0, 0, 0.3);
+}
+
+.image-overlay.selected {
+  animation: selectedPulseImage 2s ease-in-out infinite;
+}
+
+@keyframes selectedPulseImage {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(255, 0, 0, 0);
+  }
+}
+
+.pdf-structure-info {
+  font-size: 0.85rem;
+  color: #666;
+  margin-left: 1rem;
+}
+
+.text-block-overlay.selected,
+.image-overlay.selected {
+  z-index: 10;
+}
+
+.pdf-viewer-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background-color: #f5f5f5;
+  border-top: 1px solid #ddd;
+  /* why: ツールバーを最前面に表示してオーバーレイ要素に覆われないようにする */
+  /* alt: z-indexなし（オーバーレイ要素に覆われる） */
+  /* evidence: z-indexを設定することで、ツールバーが常に最前面に表示される */
+  position: relative;
+  z-index: 100;
+}
+
+.pdf-viewer-toolbar button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #0056b3;
+  border-radius: 4px;
+  /* why: ボタンの背景色とテキスト色を設定してコントラストを確保 */
+  /* alt: 背景色とテキスト色が同じ（見えない） */
+  /* evidence: 適切な色を設定することで、ボタンが明確に表示される */
+  /* why: !importantを使用して他のスタイルに上書きされないようにする */
+  /* alt: 通常の優先度（他のスタイルに上書きされる可能性がある） */
+  /* evidence: !importantにより、確実にボタンの色が適用される */
+  background-color: #007bff !important;
+  color: #ffffff !important;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background-color 0.2s ease;
+}
+
+.pdf-viewer-toolbar button:hover {
+  background-color: #0056b3 !important;
+  color: #ffffff !important;
+}
+
+.pdf-viewer-toolbar button:active {
+  background-color: #004085 !important;
+  color: #ffffff !important;
+}
+
+/* 改ページ編集が有効な時の視覚的インジケーター */
+.page-break-editor-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 5;
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 107, 0, 0.05) 0%,
+    rgba(255, 107, 0, 0.05) 100%
+  );
+  border: 2px dashed rgba(255, 107, 0, 0.3);
+  box-shadow: inset 0 0 20px rgba(255, 107, 0, 0.1);
+  animation: pageBreakPulse 2s ease-in-out infinite;
+}
+
+@keyframes pageBreakPulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* 改ページ編集ボタンのアクティブ状態 */
+.pdf-viewer-toolbar button[data-page-break-active="true"] {
+  background-color: #ff6b00 !important;
+  color: #ffffff !important;
+  box-shadow: 0 0 8px rgba(255, 107, 0, 0.5);
+  font-weight: 600;
+}
+
+.pdf-viewer-toolbar button[data-page-break-active="true"]:hover {
+  background-color: #ff8800 !important;
+  box-shadow: 0 0 12px rgba(255, 107, 0, 0.7);
+}
+
+.scroll-controls {
+  display: flex;
+  gap: 0.25rem;
+  margin-left: auto;
+  padding-left: 1rem;
+  border-left: 1px solid #ddd;
+}
+
+.scroll-controls button {
+  width: auto;
+  min-width: 3rem;
+  height: 2rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.1rem;
+  line-height: 1;
+  /* why: スクロールボタンの背景色とテキスト色を設定してコントラストを確保 */
+  /* alt: 背景色とテキスト色が同じ（見えない） */
+  /* evidence: 適切な色を設定することで、ボタンが明確に表示される */
+  /* why: !importantを使用して他のスタイルに上書きされないようにする */
+  /* alt: 通常の優先度（他のスタイルに上書きされる可能性がある） */
+  /* evidence: !importantにより、確実にボタンの色が適用される */
+  background-color: #007bff !important;
+  color: #ffffff !important;
+  border: 1px solid #0056b3 !important;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+
+.scroll-controls button:hover {
+  background-color: #0056b3 !important;
+  color: #ffffff !important;
+}
+
+.scroll-controls button:active {
+  background-color: #004085 !important;
+  color: #ffffff !important;
+}
+
+.scroll-controls .scroll-button-icon {
+  font-size: 1rem;
+  line-height: 1;
+  color: #ffffff !important;
+}
+
+.scroll-controls .scroll-button-label {
+  font-size: 0.7rem;
+  line-height: 1;
+  font-weight: 500;
+  color: #ffffff !important;
+}
+
+.editor-dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+
+.editor-dialog {
+  background-color: white;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  max-width: 90vw;
+  max-height: 90vh;
+  overflow: auto;
+}
+
+
+.pdf-viewer-canvas-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.page-break-editor-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+  /* why: オーバーレイのレンダリングをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: contents;
+  transform: translateZ(0);
+}

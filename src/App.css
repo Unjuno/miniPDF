@@ -1,0 +1,198 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  /* why: レンダリング最適化のためcontainプロパティを使用 */
+  /* alt: デフォルト（レイアウト計算が全体に影響） */
+  /* evidence: containによりレイアウト計算が局所化され、パフォーマンスが向上 */
+  contain: layout style paint;
+}
+
+.app-header {
+  padding: 1rem;
+  border-bottom: 1px solid #ccc;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #f8f9fa;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  color: #212529;
+  font-weight: 600;
+}
+
+.app-header-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.app-header button {
+  padding: 0.5rem 1rem;
+  font-size: 1rem;
+  cursor: pointer;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  /* why: ボタンのアニメーションをGPUで処理してパフォーマンス向上 */
+  /* alt: デフォルト（CPUで処理） */
+  /* evidence: transformとwill-changeによりGPUアクセラレーションが有効化 */
+  will-change: transform;
+  transition: transform 0.1s ease;
+}
+
+.app-header button:active {
+  transform: scale(0.98);
+}
+
+.app-header button:hover:not(:disabled) {
+  background-color: #0056b3;
+}
+
+.app-header button:disabled {
+  background-color: #ccc;
+  color: #6c757d;
+  cursor: not-allowed;
+}
+
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.zoom-controls .zoom-button {
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  font-size: 1.5rem;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.zoom-controls .zoom-reset-button {
+  width: auto;
+  height: 2.5rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.zoom-controls .zoom-level {
+  min-width: 4rem;
+  text-align: center;
+  font-weight: 500;
+  color: #212529;
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  /* why: MarkdownエディタとPDFプレビューを横並びにする */
+  /* evidence: 左で編集し右でプレビューを確認する2カラム構成 */
+}
+
+.markdown-pane {
+  width: 36%;
+  min-width: 320px;
+  border-right: 1px solid #d9d9d9;
+  display: flex;
+  flex-direction: column;
+  background-color: #ffffff;
+}
+
+.markdown-pane-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #ececec;
+}
+
+.markdown-pane-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.preview-status {
+  font-size: 0.8rem;
+  color: #0d6efd;
+}
+
+.preview-status.error {
+  color: #b42318;
+}
+
+.markdown-editor {
+  flex: 1;
+  border: none;
+  resize: none;
+  padding: 1rem;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  outline: none;
+}
+
+.preview-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.error-message {
+  padding: 1rem;
+  background-color: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+  border-radius: 4px;
+  margin: 1rem;
+}
+
+.loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  gap: 1rem;
+}
+
+.loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #007bff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-text {
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 500;
+  margin: 0;
+}

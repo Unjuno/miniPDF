@@ -1,0 +1,72 @@
+.page-break-editor {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.page-break-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 4px dashed #ff6b00;
+  cursor: ns-resize;
+  z-index: 10;
+  box-shadow: 0 0 8px rgba(255, 107, 0, 0.6);
+  background: linear-gradient(to bottom, rgba(255, 107, 0, 0.1), transparent);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.page-break-handle {
+  position: absolute;
+  top: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 40px;
+  height: 16px;
+  background-color: #ff6b00;
+  border-radius: 4px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  border: 2px solid #fff;
+  transition: background-color 0.2s ease, transform 0.2s ease;
+}
+
+.page-break-handle::before {
+  content: '⋮';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: white;
+  font-size: 12px;
+  font-weight: bold;
+  line-height: 1;
+}
+
+.page-break-line:hover {
+  border-color: #ff8800;
+  box-shadow: 0 0 12px rgba(255, 107, 0, 0.8);
+}
+
+.page-break-line:hover .page-break-handle {
+  background-color: #ff8800;
+  transform: translateX(-50%) scale(1.1);
+}
+
+.page-break-line.dragging {
+  border-color: #ff0000;
+  border-top-width: 5px;
+  box-shadow: 0 0 16px rgba(255, 0, 0, 0.9);
+}
+
+.page-break-line.dragging .page-break-handle {
+  background-color: #ff0000;
+  transform: translateX(-50%) scale(1.2);
+}
+
+.page-break-line {
+  top: var(--page-break-position, 0);
+}
+
+/* why: 動的な位置をCSS変数で制御してインラインスタイルを削減 */
+/* alt: インラインスタイルを使用（アクセシビリティツールの警告が発生） */
+/* evidence: CSS変数を使用することで、インラインスタイルを削減し、アクセシビリティを向上 */

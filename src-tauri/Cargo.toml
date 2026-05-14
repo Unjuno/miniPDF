@@ -1,0 +1,53 @@
+[package]
+name = "minipdf"
+version = "1.0.0"
+description = "Markdown→PDFで「最後にズレるところだけ」を、Word感覚でサクッと直せる、超軽量PDFレイアウト調整ツール"
+authors = ["you"]
+license = "AGPL-3.0"
+repository = "https://github.com/Unjuno/miniPDF"
+edition = "2021"
+
+[profile.release]
+# why: リリースビルドの最適化レベルを上げて起動時間を短縮
+# alt: デフォルト設定
+# evidence: 最適化レベルを上げることで実行時のパフォーマンスが向上
+opt-level = "z"  # サイズ最適化（起動時間重視）
+lto = true  # リンク時最適化
+codegen-units = 1  # コード生成単位を1に（最適化品質向上）
+strip = true  # シンボル情報を削除（バイナリサイズ削減）
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = [] }
+tauri-plugin-dialog = "2.0"
+tauri-plugin-fs = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+oxidize-pdf = "1.6"
+image = "0.24"
+anyhow = "1.0"
+base64 = "0.22"
+uuid = { version = "1.0", features = ["v4"] }
+flate2 = "1.0"
+log = "0.4"
+env_logger = "0.11"
+tempfile = "3.8"
+comrak = { version = "0.33", default-features = false }
+
+[features]
+# This feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3.8"
+
+[[test]]
+name = "integration_test"
+path = "tests/integration/ipc_test.rs"

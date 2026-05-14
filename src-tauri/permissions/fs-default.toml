@@ -1,0 +1,6 @@
+[[permission]]
+identifier = "fs:default"
+description = "Allows reading files from the file system"
+commands.allow = ["read_file", "read_text_file", "read_binary_file"]
+[[scope.allow]]
+path = "**"

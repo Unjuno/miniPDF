@@ -1,0 +1,21 @@
+[[permission]]
+identifier = "custom-commands"
+description = "Allows invoking custom application commands"
+commands.allow = [
+  "open_file_dialog",
+  "save_file_dialog",
+  "load_pdf",
+  "generate_pdf",
+  "save_pdf",
+  "resize_image",
+  "adjust_page_break",
+  "add_page",
+  "delete_page",
+  "reorder_pages",
+  "edit_text_block",
+  "add_text_block",
+  "insert_image",
+  "move_image",
+  "move_text_block",
+  "render_markdown_to_pdf_preview"
+]

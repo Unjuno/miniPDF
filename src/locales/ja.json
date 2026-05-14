@@ -1,0 +1,56 @@
+{
+  "app": {
+    "title": "miniPDF"
+  },
+  "header": {
+    "openFile": "ファイルを開く",
+    "save": "保存",
+    "zoomOut": "ズームアウト",
+    "zoomIn": "ズームイン",
+    "reset": "リセット",
+    "zoomLevel": "{level}%"
+  },
+  "shortcuts": {
+    "openFile": "Ctrl+O",
+    "save": "Ctrl+S",
+    "zoomOut": "Ctrl+-",
+    "zoomIn": "Ctrl++",
+    "reset": "Ctrl+0"
+  },
+  "messages": {
+    "openPdfFile": "PDFファイルを開いてください",
+    "saved": "保存しました",
+    "lastPageCannotDelete": "最後のページは削除できません",
+    "confirmDeletePage": "ページ {pageNumber} を削除しますか？"
+  },
+  "pageEditor": {
+    "title": "ページ編集",
+    "addPage": "ページを追加",
+    "newPageTitle": "新しいページを追加",
+    "insertPosition": "挿入位置（このページの後に追加）",
+    "insertAfterPage": "ページ {pageNumber} の後",
+    "width": "幅 (pt)",
+    "height": "高さ (pt)",
+    "add": "追加",
+    "cancel": "キャンセル",
+    "delete": "削除",
+    "pageInfo": "ページ {pageNumber} ({width} × {height} pt)",
+    "dragToReorder": "ドラッグして並び替え"
+  },
+  "pdfViewer": {
+    "prevPage": "前のページ",
+    "nextPage": "次のページ",
+    "pageInfo": "ページ {current} / {total}",
+    "structureInfo": "(テキスト: {textCount}個, 画像: {imageCount}個)",
+    "addText": "テキストを追加",
+    "insertImage": "画像を挿入",
+    "editPageBreak": "改ページを編集",
+    "closePageBreakEditor": "改ページ編集を閉じる"
+  },
+  "pageBreakEditor": {
+    "ariaLabel": "改ページ位置"
+  },
+  "error": {
+    "close": "閉じる"
+  }
+}

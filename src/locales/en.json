@@ -1,0 +1,56 @@
+{
+  "app": {
+    "title": "miniPDF"
+  },
+  "header": {
+    "openFile": "Open File",
+    "save": "Save",
+    "zoomOut": "Zoom Out",
+    "zoomIn": "Zoom In",
+    "reset": "Reset",
+    "zoomLevel": "{level}%"
+  },
+  "shortcuts": {
+    "openFile": "Ctrl+O",
+    "save": "Ctrl+S",
+    "zoomOut": "Ctrl+-",
+    "zoomIn": "Ctrl++",
+    "reset": "Ctrl+0"
+  },
+  "messages": {
+    "openPdfFile": "Please open a PDF file",
+    "saved": "Saved",
+    "lastPageCannotDelete": "Cannot delete the last page",
+    "confirmDeletePage": "Delete page {pageNumber}?"
+  },
+  "pageEditor": {
+    "title": "Page Editor",
+    "addPage": "Add Page",
+    "newPageTitle": "Add New Page",
+    "insertPosition": "Insert Position (add after this page)",
+    "insertAfterPage": "After page {pageNumber}",
+    "width": "Width (pt)",
+    "height": "Height (pt)",
+    "add": "Add",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "pageInfo": "Page {pageNumber} ({width} × {height} pt)",
+    "dragToReorder": "Drag to reorder"
+  },
+  "pdfViewer": {
+    "prevPage": "Previous Page",
+    "nextPage": "Next Page",
+    "pageInfo": "Page {current} / {total}",
+    "structureInfo": "(Text: {textCount}, Images: {imageCount})",
+    "addText": "Add Text",
+    "insertImage": "Insert Image",
+    "editPageBreak": "Edit Page Break",
+    "closePageBreakEditor": "Close Page Break Editor"
+  },
+  "pageBreakEditor": {
+    "ariaLabel": "Page break position"
+  },
+  "error": {
+    "close": "Close"
+  }
+}

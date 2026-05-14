@@ -1,12 +1,20 @@
 # Dependencies
 node_modules/
-target/
+
+# Build / bundler
 dist/
 dist-ssr/
 *.local
+*.tsbuildinfo
+
+# Rust — ビルド成果物のみ無視（アプリでは Cargo.lock はコミットする）
+target/
+src-tauri/target/
+# CARGO_TARGET_DIR などで target と別名になったビルド樹
+src-tauri/target-*/
 
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -14,42 +22,54 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-# Editor directories and files
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor
 .vscode/*
 !.vscode/extensions.json
-.idea
-.DS_Store
+.idea/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
-# Tauri
-src-tauri/target/
-src-tauri/Cargo.lock
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Build outputs
-*.exe
-*.dll
-*.so
-*.dylib
-
 # OS
-Thumbs.db
 .DS_Store
+Thumbs.db
 
-# Test coverage
+# Coverage / cache
 coverage/
 *.lcov
-
-# Temporary files
+.cache/
 *.tmp
 *.temp
-.cache/
 
+# Playwright / MCP 作業用（コミット不要）
+.playwright-mcp
+**/.playwright-mcp/**
+playwright-report/
+test-results/
+
+# 誤ってコミットしがちなスクショ・一時画像
+image.png
+screenshot*.png
+Screen*.png
+
+# テスト用生成物（README など追跡したいものは ! で除外）
+test_data/*.pdf
+test_data/*.png
+test_data/*.jpg
+test_data/*.jpeg
+!test_data/README.md
+
+# ローカル PDF（必要ならファイル名を足す）
+mian.pdf
+
+# 個人メモ（誤字ファイル名のままローカル専用）
+reviw.md
+
+# 広すぎる *.pdf / *.exe は使わない（fixtures の PDF をコミットできるようにする）

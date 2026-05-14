@@ -1,0 +1,199 @@
+.text-editor-view,
+.text-editor-edit {
+  background-color: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 1rem;
+  margin: 0.5rem 0;
+}
+
+.text-editor-content {
+  min-height: 100px;
+  padding: 0.5rem;
+  border: 1px dashed #ccc;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.text-editor-content:hover {
+  border-color: #007bff;
+  background-color: #f8f9fa;
+}
+
+.text-editor-textarea {
+  width: 100%;
+  min-height: 200px;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 1rem;
+  resize: vertical;
+}
+
+.text-editor-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  justify-content: flex-end;
+}
+
+.text-editor-actions button {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.text-editor-actions .save-btn {
+  background-color: #28a745;
+  color: white;
+}
+
+.text-editor-actions .save-btn:hover {
+  background-color: #218838;
+}
+
+.text-editor-actions .cancel-btn {
+  background-color: #6c757d;
+  color: white;
+}
+
+.text-editor-actions .cancel-btn:hover {
+  background-color: #545b62;
+}
+
+.text-input-dialog {
+  background-color: white;
+  padding: 1.5rem;
+  border-radius: 8px;
+  border: 1px solid #ddd;
+  min-width: 400px;
+  max-width: 600px;
+}
+
+.text-input-dialog h3 {
+  margin-top: 0;
+  margin-bottom: 1rem;
+}
+
+.text-input-textarea {
+  width: 100%;
+  min-height: 150px;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 1rem;
+  resize: vertical;
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 1rem;
+}
+
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 1.5rem;
+}
+
+.form-actions button {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.form-actions .save-btn {
+  background-color: #28a745;
+  color: white;
+}
+
+.form-actions .save-btn:hover {
+  background-color: #218838;
+}
+
+.form-actions .cancel-btn {
+  background-color: #6c757d;
+  color: white;
+}
+
+.form-actions .cancel-btn:hover {
+  background-color: #545b62;
+}
+
+.text-editor-label {
+  /* why: スクリーンリーダー用のラベルを視覚的に非表示 */
+  /* alt: 表示（UIが冗長になる） */
+  /* evidence: スクリーンリーダーは読み取るが、視覚的には非表示 */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+.text-editor-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem;
+  background-color: #f8f9fa;
+  border-radius: 4px;
+  border: 1px solid #dee2e6;
+}
+
+.text-editor-toolbar-btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  background-color: white;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.2s;
+}
+
+.text-editor-toolbar-btn:hover {
+  background-color: #e9ecef;
+  border-color: #adb5bd;
+}
+
+.text-editor-toolbar-btn:active {
+  background-color: #dee2e6;
+}
+
+.text-editor-hint {
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.85rem;
+  color: #6c757d;
+  background-color: #f8f9fa;
+  border-radius: 4px;
+  border: 1px solid #dee2e6;
+}
+

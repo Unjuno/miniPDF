@@ -1,0 +1,72 @@
+.image-element {
+  position: absolute;
+  /* why: 動的な位置をCSS変数で制御（インラインスタイルを削減） */
+  /* alt: すべてインラインスタイル（アクセシビリティツールの警告が発生） */
+  /* evidence: CSS変数を使用することで、インラインスタイルを削減し、アクセシビリティを向上 */
+  left: var(--element-left, 0);
+  top: var(--element-top, 0);
+  width: var(--element-width, 0);
+  height: var(--element-height, 0);
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.image-element:hover {
+  border-color: #007bff;
+}
+
+.image-element.selected {
+  border-color: #007bff;
+  box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.25);
+}
+
+.resize-handles {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.resize-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background-color: #007bff;
+  border: 2px solid white;
+  border-radius: 50%;
+  pointer-events: all;
+  cursor: nwse-resize;
+}
+
+.resize-handle-nw {
+  top: -6px;
+  left: -6px;
+  cursor: nwse-resize;
+}
+
+.resize-handle-ne {
+  top: -6px;
+  right: -6px;
+  cursor: nesw-resize;
+}
+
+.resize-handle-sw {
+  bottom: -6px;
+  left: -6px;
+  cursor: nesw-resize;
+}
+
+.resize-handle-se {
+  bottom: -6px;
+  right: -6px;
+  cursor: nwse-resize;
+}
+
+.image-element-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
