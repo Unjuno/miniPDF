@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { readFile, writeFile } from '@tauri-apps/plugin-fs';
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ErrorDisplay } from './components/ErrorDisplay';
+import { PDFViewer } from './components/PDFViewer';
 import { ToastContainer } from './components/Toast';
 import { KeyboardShortcutsHelp } from './components/KeyboardShortcutsHelp';
 import { useToast } from './hooks/useToast';
@@ -9,10 +10,15 @@ import { useDebounce } from './hooks/useDebounce';
 import { usePdfStore } from './stores/pdfStore';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { logger } from './utils/logger';
+import { isMarkdownFilePath } from './utils/markdownFile';
 import { isTauriRuntimeAvailable } from './utils/tauriRuntime';
+import { estimatePreviewPageFromMarkdown, getLineNumberFromOffset } from './utils/markdownPositionSync';
+import {
+  insertMarkdownHardBreak,
+  restoreTextareaCursor,
+  resolveEditorCursorOffset,
+} from './utils/markdownEditor';
 import './App.css';
-
-const PDFViewer = lazy(() => import('./components/PDFViewer').then(m => ({ default: m.PDFViewer })));
 
 function App() {
   const isTauriRuntime = useMemo(() => isTauriRuntimeAvailable(), []);
@@ -27,8 +33,10 @@ function App() {
   const markdownText = usePdfStore((state) => state.markdownText);
   const isPreviewBuilding = usePdfStore((state) => state.isPreviewBuilding);
   const previewError = usePdfStore((state) => state.previewError);
+  const currentPage = usePdfStore((state) => state.currentPage);
   const setMarkdownText = usePdfStore((state) => state.setMarkdownText);
   const requestMarkdownPreview = usePdfStore((state) => state.requestMarkdownPreview);
+  const setCurrentPage = usePdfStore((state) => state.setCurrentPage);
   const setZoomLevel = usePdfStore((state) => state.setZoomLevel);
   const clearError = usePdfStore((state) => state.clearError);
 
@@ -38,7 +46,17 @@ function App() {
   // evidence: pdfStoreのisLoadingを使用することで、状態の一貫性を保つ
   const isLoading = usePdfStore((state) => state.isLoading);
   const debouncedMarkdown = useDebounce(markdownText, 450);
+  const [editorCursorLine, setEditorCursorLine] = useState(1);
   const previewRequestIdRef = useRef(0);
+  const markdownEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const pendingCursorOffsetRef = useRef<number | null>(null);
+  const currentPageRef = useRef(currentPage);
+  const debouncedCursorLine = useDebounce(editorCursorLine, 120);
+
+  const syncEditorCursor = useCallback((text: string, cursorOffset: number) => {
+    const lineNumber = getLineNumberFromOffset(text, cursorOffset);
+    setEditorCursorLine(lineNumber);
+  }, []);
 
   const handleOpenMarkdown = useCallback(async () => {
     if (!isTauriRuntime) {
@@ -48,6 +66,10 @@ function App() {
     try {
       const filePath = await invoke<string | null>('open_file_dialog');
       if (filePath) {
+        if (!isMarkdownFilePath(filePath)) {
+          showError('Markdownファイル（.md / .markdown / .mdown）のみ開けます。');
+          return;
+        }
         try {
           const bytes = await readFile(filePath);
           const text = new TextDecoder().decode(bytes);
@@ -73,7 +95,7 @@ function App() {
     }
     if (!markdownText.trim()) return;
     try {
-      const filePath = await invoke<string | null>('save_file_dialog');
+      const filePath = await invoke<string | null>('save_file_dialog', { target: 'markdown' });
       if (!filePath) return;
       const bytes = new TextEncoder().encode(markdownText);
       await writeFile(filePath, bytes);
@@ -93,7 +115,7 @@ function App() {
     if (!pdfStructure) return;
 
     try {
-      const filePath = await invoke<string | null>('save_file_dialog');
+      const filePath = await invoke<string | null>('save_file_dialog', { target: 'pdf' });
       if (!filePath) return;
       await savePdf(filePath);
       success('PDFファイルを保存しました');
@@ -117,6 +139,22 @@ function App() {
   }, [setZoomLevel]);
 
   useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
+
+  useEffect(() => {
+    if (!pdfStructure?.pages?.length) return;
+    const targetPage = estimatePreviewPageFromMarkdown(
+      markdownText,
+      debouncedCursorLine,
+      pdfStructure.pages.length
+    );
+    if (targetPage !== currentPageRef.current) {
+      setCurrentPage(targetPage);
+    }
+  }, [debouncedCursorLine, markdownText, pdfStructure?.pages?.length, setCurrentPage]);
+
+  useEffect(() => {
     if (!isTauriRuntime) {
       return;
     }
@@ -126,7 +164,7 @@ function App() {
       try {
         const previewPdfPath = await requestMarkdownPreview(debouncedMarkdown, requestId);
         if (!previewPdfPath) return;
-        await loadPdf(previewPdfPath);
+        await loadPdf(previewPdfPath, { preserveCurrentPage: true });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         showError(`プレビュー生成に失敗しました: ${errorMessage}`);
@@ -198,9 +236,62 @@ function App() {
             {previewError && <span className="preview-status error">{previewError}</span>}
           </div>
           <textarea
+            ref={markdownEditorRef}
             className="markdown-editor"
             value={markdownText}
-            onChange={(event) => setMarkdownText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Enter' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) {
+                return;
+              }
+              const el = markdownEditorRef.current;
+              if (!el) return;
+              event.preventDefault();
+              const { text, cursorOffset } = insertMarkdownHardBreak(
+                markdownText,
+                el.selectionStart ?? markdownText.length,
+                el.selectionEnd ?? markdownText.length
+              );
+              pendingCursorOffsetRef.current = cursorOffset;
+              setMarkdownText(text);
+              syncEditorCursor(text, cursorOffset);
+              requestAnimationFrame(() => {
+                restoreTextareaCursor(markdownEditorRef.current, cursorOffset);
+                pendingCursorOffsetRef.current = null;
+              });
+            }}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              const nextCursorOffset = resolveEditorCursorOffset(
+                pendingCursorOffsetRef.current,
+                event.target.selectionStart ?? nextValue.length
+              );
+              setMarkdownText(nextValue);
+              syncEditorCursor(nextValue, nextCursorOffset);
+            }}
+            onSelect={() => {
+              const el = markdownEditorRef.current;
+              if (!el) return;
+              syncEditorCursor(
+                el.value,
+                resolveEditorCursorOffset(pendingCursorOffsetRef.current, el.selectionStart ?? el.value.length)
+              );
+            }}
+            onKeyUp={() => {
+              const el = markdownEditorRef.current;
+              if (!el) return;
+              syncEditorCursor(
+                el.value,
+                resolveEditorCursorOffset(pendingCursorOffsetRef.current, el.selectionStart ?? el.value.length)
+              );
+            }}
+            onClick={() => {
+              const el = markdownEditorRef.current;
+              if (!el) return;
+              syncEditorCursor(
+                el.value,
+                resolveEditorCursorOffset(pendingCursorOffsetRef.current, el.selectionStart ?? el.value.length)
+              );
+            }}
             placeholder="# Markdownを入力してください"
           />
         </section>
@@ -211,9 +302,7 @@ function App() {
           </div>
         )}
         <section className="preview-pane">
-          <Suspense fallback={null}>
-            <PDFViewer pdfStructure={pdfStructure} zoomLevel={zoomLevel} previewOnly />
-          </Suspense>
+          <PDFViewer pdfStructure={pdfStructure} zoomLevel={zoomLevel} previewOnly />
         </section>
         <ToastContainer toasts={toasts} onDismiss={dismissToast} />
       </main>

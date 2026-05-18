@@ -6,9 +6,10 @@ pub async fn open_file_dialog(app: tauri::AppHandle) -> Result<Option<String>, S
     let file_path = app
         .dialog()
         .file()
-        .add_filter("PDF", &["pdf"])
+        .set_file_name("input.md")
+        .add_filter("Markdown", &["md", "markdown", "mdown"])
         .blocking_pick_file();
-    
+
     Ok(file_path.map(|p| p.to_string()))
 }
 

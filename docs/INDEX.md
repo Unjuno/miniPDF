@@ -10,10 +10,14 @@
 
 1. [../README.md](../README.md) — 概要・セットアップ
 2. [./FEATURES.md](./FEATURES.md) — ユーザー向け操作
-3. [./SPECIFICATION.md](./SPECIFICATION.md) — 実装・IPC の参照
-4. [./CURRENT_ISSUES_SUMMARY.md](./CURRENT_ISSUES_SUMMARY.md) — 既知の問題・リスク（**問題トピックの正本**）
-5. [./dev/repo-cleanup-shim-inventory.md](./dev/repo-cleanup-shim-inventory.md) — フロントのディレクトリ整理メモ（開発者向け）
-6. [./RELEASING.md](./RELEASING.md) — GitHub Actions による CI・インストーラービルド・タグリリース
+3. [./HTML_PREVIEW.md](./HTML_PREVIEW.md) — HTML ベースのプレビュー実装メモ
+4. [./markdown-editor-preview-sync.md](./markdown-editor-preview-sync.md) — エディタとプレビューの位置同期メモ
+5. [./markdown-katex-rendering.md](./markdown-katex-rendering.md) — KaTeX 数式レンダリングメモ
+6. [./markdown-preview-cli.md](./markdown-preview-cli.md) — Markdown を PDF に出力する CLI
+7. [./SPECIFICATION.md](./SPECIFICATION.md) — 実装・IPC の参照
+8. [./CURRENT_ISSUES_SUMMARY.md](./CURRENT_ISSUES_SUMMARY.md) — 既知の問題・リスク（**問題トピックの正本**）
+9. [./dev/repo-cleanup-shim-inventory.md](./dev/repo-cleanup-shim-inventory.md) — フロントのディレクトリ整理メモ（開発者向け）
+10. [./RELEASING.md](./RELEASING.md) — GitHub Actions による CI・インストーラービルド・タグリリース
 
 ### 1. プロジェクト概要
 
@@ -103,6 +107,50 @@
 - パフォーマンス情報
 
 **読むべきタイミング**: アプリケーションの使い方を知りたい時、機能の詳細を確認したい時、操作方法を確認したい時
+
+---
+
+#### [./HTML_PREVIEW.md](./HTML_PREVIEW.md)
+**HTML ベースの Markdown プレビュー実装メモ**
+
+- Markdown を HTML コンテナに変換してページ単位で描画する仕組み
+- 印刷時のズレ確認に寄せた再現方針
+- Mermaid・ページ分割・制約の整理
+
+**読むべきタイミング**: プレビュー描画の方式や制約を確認したい時
+
+---
+
+#### [./markdown-editor-preview-sync.md](./markdown-editor-preview-sync.md)
+**Markdown エディタとプレビューの位置同期メモ**
+
+- カーソル位置からプレビューのページ位置を推定して追従する仕組み
+- プレビュー側スクロールに合わせて現在ページを更新する挙動
+- 完全一致ではなく、近い位置へ寄せるための制約
+
+**読むべきタイミング**: エディタとプレビューの追従ロジックを確認したい時
+
+---
+
+#### [./markdown-katex-rendering.md](./markdown-katex-rendering.md)
+**KaTeX 数式レンダリングメモ**
+
+- `$...$` と `$$...$$` の数式を KaTeX で画像化する流れ
+- 保存時も同じ数式レンダリングを使う前提
+- PNG 埋め込みやフォールバックの制約
+
+**読むべきタイミング**: 数式レンダリングの方式や制約を確認したい時
+
+---
+
+#### [./markdown-preview-cli.md](./markdown-preview-cli.md)
+**Markdown を PDF に出力する CLI**
+
+- Markdown を PDF プレビューとして直接出力するコマンドライン実行方法
+- `cargo run` と `npm run markdown:preview` の両方から使える
+- Tauri のプレビューコマンドと同じレンダリング経路を共有する
+
+**読むべきタイミング**: CLI でプレビュー PDF を生成したい時、手元で再現確認したい時
 
 ---
 

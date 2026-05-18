@@ -17,4 +17,11 @@ describe('tauri permissions', () => {
 
     expect(capability.permissions).toContain('custom-commands');
   });
+
+  it('allows file writes for Markdown saves', () => {
+    const capabilityPath = path.resolve(__dirname, '../src-tauri/capabilities/main-capability.json');
+    const capability = JSON.parse(readFileSync(capabilityPath, 'utf8')) as { permissions?: string[] };
+
+    expect(capability.permissions).toContain('fs:allow-write-file');
+  });
 });

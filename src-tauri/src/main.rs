@@ -31,6 +31,7 @@ fn main() {
             commands::image_mover::move_image,
             commands::text_mover::move_text_block,
             commands::markdown_preview::render_markdown_to_pdf_preview,
+            commands::markdown_preview::render_markdown_to_html_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

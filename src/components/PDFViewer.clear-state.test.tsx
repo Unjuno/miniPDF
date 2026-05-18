@@ -31,6 +31,7 @@ vi.mock('pdfjs-dist', () => ({
       numPages: 0,
       getPage: vi.fn(),
     }),
+    destroy: vi.fn(() => Promise.resolve()),
   })),
 }));
 
@@ -59,6 +60,7 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
 
   it('starts in continuous mode for print-preview style browsing', async () => {
     vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const loadingTaskDestroyMock = vi.fn(() => Promise.resolve());
 
     const getViewport = vi.fn(({ scale = 1 }) => ({
       width: 595 * scale,
@@ -76,6 +78,7 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
         getPage,
         destroy: vi.fn(),
       }),
+      destroy: loadingTaskDestroyMock,
     } as unknown as ReturnType<typeof import('pdfjs-dist')['getDocument']>);
 
     HTMLCanvasElement.prototype.getContext = vi.fn(() => null);
@@ -95,7 +98,7 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
       ],
     };
 
-    const { container } = render(<PDFViewer pdfStructure={pdfStructure} zoomLevel={1} previewOnly />);
+    const { container, unmount } = render(<PDFViewer pdfStructure={pdfStructure} zoomLevel={1} previewOnly />);
 
     await waitFor(() => {
       expect(container.querySelector('[data-view-mode="continuous"]')).not.toBeNull();
@@ -106,7 +109,78 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
       expect(vi.mocked(pdfjs.getDocument)).toHaveBeenCalled();
     });
 
-    expect(screen.getByRole('button', { name: '1ページ表示' })).toBeTruthy();
+    unmount();
+    await waitFor(() => {
+      expect(loadingTaskDestroyMock).toHaveBeenCalled();
+    });
+  });
+
+  it('preserves the current page when loading a refreshed preview PDF', async () => {
+    vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
+    const loadingTaskDestroyMock = vi.fn(() => Promise.resolve());
+
+    const getViewport = vi.fn(({ scale = 1 }) => ({
+      width: 595 * scale,
+      height: 842 * scale,
+    }));
+    const renderMock = vi.fn(() => ({ promise: Promise.resolve() }));
+    const getPage = vi.fn(async () => ({
+      getViewport,
+      render: renderMock,
+    }));
+
+    vi.mocked((await import('pdfjs-dist')).getDocument).mockReturnValue({
+      promise: Promise.resolve({
+        numPages: 3,
+        getPage,
+        destroy: vi.fn(),
+      }),
+      destroy: loadingTaskDestroyMock,
+    } as unknown as ReturnType<typeof import('pdfjs-dist')['getDocument']>);
+
+    HTMLCanvasElement.prototype.getContext = vi.fn(() => null);
+    HTMLElement.prototype.scrollTo = vi.fn();
+
+    usePdfStore.setState({ currentPage: 3 });
+
+    const pdfStructure = {
+      filePath: 'preview.pdf',
+      metadata: {},
+      pages: [
+        {
+          pageNumber: 1,
+          sourcePageNumber: 1,
+          width: 595,
+          height: 842,
+          images: [],
+          textBlocks: [],
+        },
+        {
+          pageNumber: 2,
+          sourcePageNumber: 2,
+          width: 595,
+          height: 842,
+          images: [],
+          textBlocks: [],
+        },
+        {
+          pageNumber: 3,
+          sourcePageNumber: 3,
+          width: 595,
+          height: 842,
+          images: [],
+          textBlocks: [],
+        },
+      ],
+    };
+
+    render(<PDFViewer pdfStructure={pdfStructure} zoomLevel={1} previewOnly />);
+
+    const pdfjs = await import('pdfjs-dist');
+    await waitFor(() => {
+      expect(vi.mocked(pdfjs.getDocument)).toHaveBeenCalled();
+      expect(usePdfStore.getState().currentPage).toBe(3);
+    });
   });
 
   it('previewOnly hides layout overlays and edit toolbar actions', async () => {
@@ -128,6 +202,7 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
         getPage,
         destroy: vi.fn(),
       }),
+      destroy: vi.fn(() => Promise.resolve()),
     } as unknown as ReturnType<typeof import('pdfjs-dist')['getDocument']>);
 
     HTMLCanvasElement.prototype.getContext = vi.fn(() => null);

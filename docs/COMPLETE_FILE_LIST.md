@@ -7,13 +7,13 @@
 
 ## ファイル統計
 
-- **Markdownファイル**: 24ファイル
+- **Markdownファイル**: 25ファイル
 - **TypeScript/TSXファイル**: 36ファイル
 - **Rustファイル**: 21ファイル
 - **CSSファイル**: 13ファイル
 - **JSONファイル**: 12ファイル
 - **TOMLファイル**: 3ファイル
-- **その他**: 66ファイル（画像、設定ファイル等）
+- **その他**: 65ファイル（画像、設定ファイル等）
 
 ## 1. ルートディレクトリファイル
 
@@ -33,7 +33,6 @@
 
 ### その他
 - `index.html` - HTMLエントリーポイント
-- `image.png` - プロジェクト画像
 - `mian.pdf` - テスト用PDFファイル（typoあり、実際のテストで使用）
 
 ## 2. docs/ ディレクトリ
@@ -44,6 +43,9 @@
 - `SPECIFICATION.md` - 機能仕様・実装方法
 - `FEATURES.md` - 機能説明書（ユーザー向け）⭐
 - `DO_NOT.md` - やらないこと制約リスト
+
+### 追加ドキュメント（1ファイル）
+- `markdown-preview-cli.md` - Markdown を PDF に出力する CLI
 
 ### 実装・検証ドキュメント（3ファイル）
 - `IMPLEMENTATION_PLAN.md` - 実装計画（AI開発支援用）
@@ -60,11 +62,12 @@
 - `FILE_LIST.md` - プロジェクトファイルリスト（構造説明）
 - `COMPLETE_FILE_LIST.md` - 完全ファイルリスト（このファイル）
 
-### バグノート（docs/bugs/ - 6ファイル）
+### バグノート（docs/bugs/ - 7ファイル）
 - `page-delete-render-mismatch.md` - ページ削除時のレンダリング不一致
 - `page-reorder-dnd.md` - ページ並び替えのドラッグアンドドロップ
 - `preview-blank-page-render.md` - プレビューの空白ページレンダリング
 - `preview-reorder-not-updating.md` - プレビューの並び替え更新
+- `20260519-thematic-break-style-variants.md` - 水平線の記法ごとの差分レンダリング
 - `readme-missing-links.md` - READMEのリンク不足
 - `zoom-minus-button.md` - ズームマイナスボタン
 
@@ -228,9 +231,9 @@
 - **CSS**: 13ファイル
 
 ### ドキュメント
-- **Markdown**: 22ファイル
+- **Markdown**: 23ファイル
   - ルート: 2ファイル（README.md, AGENTS.md）
-  - docs/: 19ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, バグノート6ファイル）
+  - docs/: 22ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート6ファイル）
   - .playwright-mcp/: 1ファイル（ui-test-snapshot.md）
 
 ### 設定ファイル
@@ -247,4 +250,3 @@
 - [FILE_LIST.md](./FILE_LIST.md) - プロジェクトファイルリスト（構造説明）
 - [INDEX.md](./INDEX.md) - ドキュメント索引
 - [README.md](../README.md) - プロジェクト基本情報
-

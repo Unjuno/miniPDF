@@ -58,6 +58,10 @@ test-results/
 image.png
 screenshot*.png
 Screen*.png
+/page-*.png
+/out-page-*.png
+/katex-*.png
+/tmp_pdf_pages/
 
 # テスト用生成物（README など追跡したいものは ! で除外）
 test_data/*.pdf

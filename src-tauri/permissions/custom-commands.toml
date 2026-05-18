@@ -17,5 +17,6 @@ commands.allow = [
   "insert_image",
   "move_image",
   "move_text_block",
-  "render_markdown_to_pdf_preview"
+  "render_markdown_to_pdf_preview",
+  "render_markdown_to_html_preview"
 ]

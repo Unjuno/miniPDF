@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { readFile } from '@tauri-apps/plugin-fs';
 import { PdfStructure, ImageElement, Page } from '../types/pdf';
 import { logger } from '../utils/logger';
 import { getSourcePageNumber } from '../utils/pageMapping';
@@ -18,6 +19,7 @@ interface PdfStore {
   isPreviewBuilding: boolean;
   previewError: string | null;
   previewPdfPath: string | null;
+  previewHtml: string | null;
   previewRequestId: number;
   isLoading: boolean; // why: PDF読み込み中のフラグ（競合状態を防ぐ）
   // alt: フラグなし（読み込み中に他の操作が実行される可能性がある）
@@ -27,7 +29,7 @@ interface PdfStore {
   // evidence: フラグにより、編集操作中の他の編集操作をブロックできる
 
   // Actions
-  loadPdf: (filePath: string) => Promise<void>;
+  loadPdf: (filePath: string, options?: { preserveCurrentPage?: boolean }) => Promise<void>;
   selectImage: (imageId: string | null) => void;
   selectTextBlock: (textBlockId: string | null) => void;
   resizeImage: (imageId: string, width: number, height: number) => Promise<void>;
@@ -66,11 +68,12 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
   isPreviewBuilding: false,
   previewError: null,
   previewPdfPath: null,
+  previewHtml: null,
   previewRequestId: 0,
   isLoading: false,
   isEditing: false,
 
-  loadPdf: async (filePath: string) => {
+  loadPdf: async (filePath: string, options?: { preserveCurrentPage?: boolean }) => {
     // why: 既に読み込み中の場合は、新しい読み込みをブロック（競合状態を防ぐ）
     // alt: 読み込み中でも新しい読み込みを許可（状態が不整合になる可能性がある）
     // evidence: フラグにより、同時に複数の読み込み操作が実行されることを防ぐ
@@ -85,6 +88,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
     // evidence: 変数を外側で宣言することで、catchブロックからもアクセスできる
     let pdf: import('pdfjs-dist').PDFDocumentProxy | null = null;
     let loadingTask: import('pdfjs-dist').PDFLoadingTask | null = null;
+    const shouldPreserveCurrentPage = options?.preserveCurrentPage === true;
     
     try {
       logger.info('Loading PDF', { filePath });
@@ -93,7 +97,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
         pdfStructure: null,
         selectedImageId: null,
         selectedTextBlockId: null,
-        currentPage: 1,
+        currentPage: shouldPreserveCurrentPage ? state.currentPage : 1,
         zoomLevel: 1,
         isLoading: true, // why: 読み込み開始をマーク
       });
@@ -369,7 +373,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           pdfStructure: updatedStructure,
           selectedImageId: null,
           selectedTextBlockId: null,
-          currentPage: 1,
+          currentPage: shouldPreserveCurrentPage ? state.currentPage : 1,
           zoomLevel: 1,
           isLoading: false, // why: 読み込み完了をマーク
         });
@@ -412,7 +416,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           pdfStructure: structure,
           selectedImageId: null,
           selectedTextBlockId: null,
-          currentPage: 1,
+          currentPage: shouldPreserveCurrentPage ? state.currentPage : 1,
           zoomLevel: 1,
           isLoading: false,
           error: errorMessage, // why: エラーをユーザーに通知
@@ -464,7 +468,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
         pdfStructure: null,
         selectedImageId: null,
         selectedTextBlockId: null,
-        currentPage: 1,
+        currentPage: shouldPreserveCurrentPage ? state.currentPage : 1,
         zoomLevel: 1,
         isLoading: false, // why: エラー時も読み込み完了をマーク
       });
@@ -759,19 +763,74 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
 
       set({ isEditing: true });
 
-      // why: 最新のpdfStructureを使用してPDFを生成（編集内容を反映するため）
-      // alt: 古いpdfStructureを使用（編集内容が反映されない）
-      // evidence: state.pdfStructureを使用することで、最新の編集内容が反映される
       const currentState = get();
       if (!currentState.pdfStructure) {
         set({ isEditing: false });
         throw new Error('PDFが読み込まれていません');
       }
 
+      const shouldReusePreviewPdf =
+        !!currentState.previewPdfPath &&
+        currentState.previewPdfPath === currentState.pdfStructure.filePath;
+
+      if (shouldReusePreviewPdf) {
+        try {
+          const pdfData = await readFile(currentState.previewPdfPath as string);
+          if (!pdfData || pdfData.length === 0) {
+            throw new Error('プレビューPDFの読み込みに失敗しました（データが空です）');
+          }
+
+          await invoke('save_pdf', {
+            filePath,
+            pdfData,
+          });
+
+          logger.info('PDF saved successfully from preview source', { filePath });
+          set({ isEditing: false });
+          return;
+        } catch (error) {
+          logger.warn('Failed to reuse preview PDF, falling back to regeneration', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const shouldReuseSourcePdf =
+        !currentState.previewPdfPath &&
+        !!currentState.pdfStructure.filePath &&
+        currentState.pdfStructure.pages.every((page) =>
+          (page.images || []).every((image) => !image.data || image.data.trim().length === 0)
+        );
+
+      if (shouldReuseSourcePdf) {
+        try {
+          const sourceBytes = await readFile(currentState.pdfStructure.filePath);
+          if (!sourceBytes || sourceBytes.length === 0) {
+            throw new Error('元のPDFの読み込みに失敗しました（データが空です）');
+          }
+
+          await invoke('save_pdf', {
+            filePath,
+            pdfData: sourceBytes,
+          });
+
+          logger.info('PDF saved successfully from source file', { filePath });
+          set({ isEditing: false });
+          return;
+        } catch (error) {
+          logger.warn('Failed to reuse source PDF, falling back to regeneration', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // why: 最新のpdfStructureを使用してPDFを生成（編集内容を反映するため）
+      // alt: 古いpdfStructureを使用（編集内容が反映されない）
+      // evidence: state.pdfStructureを使用することで、最新の編集内容が反映される
       const pdfData = await invoke<number[]>('generate_pdf', {
         pdfStructure: currentState.pdfStructure,
       });
-      
+
       // why: pdfDataが空の場合をチェックして、無効なPDFの保存を防ぐ
       // alt: チェックなし（空のPDFが保存される可能性がある）
       // evidence: 空のPDFデータの保存を防ぐことで、ユーザーに問題を通知できる
@@ -1252,6 +1311,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           isPreviewBuilding: false,
           previewError: 'ブラウザモードではPDFライブプレビューは利用できません。tauri:dev で確認してください。',
           previewPdfPath: null,
+          previewHtml: null,
           previewRequestId: requestId,
         });
         return null;
@@ -1261,6 +1321,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           isPreviewBuilding: false,
           previewError: null,
           previewPdfPath: null,
+          previewHtml: null,
           previewRequestId: requestId,
         });
         return null;
@@ -1279,6 +1340,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
         isPreviewBuilding: false,
         previewError: null,
         previewPdfPath: filePath,
+        previewHtml: null,
       });
       return filePath;
     } catch (error) {
@@ -1290,6 +1352,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
       set({
         isPreviewBuilding: false,
         previewError: message,
+        previewHtml: null,
       });
       throw error;
     }

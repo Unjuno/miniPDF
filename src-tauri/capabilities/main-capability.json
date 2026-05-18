@@ -6,6 +6,7 @@
   "permissions": [
     "fs:default",
     "fs:allow-read-file",
+    "fs:allow-write-file",
     {
       "identifier": "fs:scope",
       "allow": [

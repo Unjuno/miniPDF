@@ -6,6 +6,7 @@ authors = ["you"]
 license = "AGPL-3.0"
 repository = "https://github.com/Unjuno/miniPDF"
 edition = "2021"
+default-run = "minipdf"
 
 [profile.release]
 # why: リリースビルドの最適化レベルを上げて起動時間を短縮
@@ -38,6 +39,8 @@ log = "0.4"
 env_logger = "0.11"
 tempfile = "3.8"
 comrak = { version = "0.33", default-features = false }
+unicode-segmentation = "1.11"
+rusttype = "0.9"
 
 [features]
 # This feature is used for production builds or when `devPath` points to the filesystem

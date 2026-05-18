@@ -1,13 +1,19 @@
+use std::fmt::Write as _;
 use std::fs;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use base64::{engine::general_purpose, Engine as _};
-use comrak::nodes::{AstNode, ListType, NodeCode, NodeCodeBlock, NodeValue};
+use comrak::nodes::{AstNode, ListType, NodeCode, NodeCodeBlock, NodeMath, NodeValue};
 use comrak::{parse_document, Arena, Options};
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageOutputFormat, Rgb};
 use oxidize_pdf::{Color, Document, Font, Image, Page as OxidizePage};
+use rusttype::{point, Font as RustFont, Scale};
+use serde::Deserialize;
 use tauri::command;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 use crate::utils::font_manager;
@@ -16,14 +22,23 @@ const PAGE_WIDTH: f64 = 595.0;
 const PAGE_HEIGHT: f64 = 842.0;
 const MARGIN: f64 = 40.0;
 const BASE_LINE_HEIGHT: f64 = 16.0;
+const MERMAID_MAX_DISPLAY_HEIGHT: f64 = 260.0;
+const MERMAID_PT_PER_PX: f64 = 0.75;
+const MATH_INLINE_Y_OFFSET_PT: f64 = -3.0;
+const MATH_INLINE_EXTRA_LINE_PT: f64 = 8.0;
 const JP_SANS_FONT: &str = "NotoSansJP";
 const JP_SANS_BOLD: &str = "NotoSansJP-Bold";
+const EMOJI_FONT: &str = "Emoji";
+const EMOJI_RASTER_PX_PER_PT: f32 = 6.0;
+const EMOJI_DISPLAY_SCALE: f64 = 1.45;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TextStyle {
     bold: bool,
     italic: bool,
     code: bool,
+    link: bool,
+    math: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +72,10 @@ enum MarkdownBlock {
         spans: Vec<InlineSpan>,
     },
     Paragraph(Vec<InlineSpan>),
+    /// Markdown の空行をページレイアウトに反映するための余白ブロック。
+    Spacer {
+        lines: usize,
+    },
     /// ネストした箇条書きは `indent` を増やしてフラット化する。
     ListItem {
         indent: u8,
@@ -68,21 +87,82 @@ enum MarkdownBlock {
         spans: Vec<InlineSpan>,
     },
     /// `---` / `***` / `___` などの区切り線。
-    ThematicBreak,
+    ThematicBreak(ThematicBreakStyle),
     /// 各行はセルごとのインライン列（列数は行ごとに揃う想定）
     Table(Vec<Vec<Vec<InlineSpan>>>),
     CodeBlock {
         lang: String,
         code: String,
     },
-    Blockquote(Vec<InlineSpan>),
+    DisplayMath(String),
+    Blockquote(Vec<BlockquoteLine>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThematicBreakStyle {
+    Hyphen,
+    Asterisk,
+    Underscore,
+}
+
+#[derive(Debug, Clone)]
+enum BlockquoteLine {
+    Text(Vec<InlineSpan>),
+    DisplayMath(String),
+    CodeBlock { code: String },
+}
+
+#[derive(Debug, Clone)]
+struct MathRenderImage {
+    jpeg_data: Vec<u8>,
+    width_pt: f64,
+    height_pt: f64,
+    baseline_pt: f64,
+}
+
+#[derive(Debug, Default)]
+struct MathRenderCache {
+    entries: HashMap<(String, bool), Option<MathRenderImage>>,
+}
+
+impl MathRenderCache {
+    fn render(&mut self, expr: &str, display_mode: bool) -> Option<MathRenderImage> {
+        let key = (expr.to_string(), display_mode);
+        if let Some(cached) = self.entries.get(&key) {
+            return cached.clone();
+        }
+        let rendered = render_math_with_katex(expr, display_mode).ok().flatten();
+        self.entries.insert(key, rendered.clone());
+        rendered
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MathRenderResponse {
+    #[serde(rename = "width")]
+    _width: f64,
+    #[serde(rename = "height")]
+    _height: f64,
+    #[serde(rename = "baselineOffset")]
+    baseline_offset: f64,
+    #[serde(rename = "devicePixelRatio")]
+    device_pixel_ratio: f64,
+    png: String,
+}
+
+fn scale_math_image(rendered: &MathRenderImage, max_height_pt: f64) -> (f64, f64) {
+    let scale = if rendered.height_pt > 0.0 {
+        (max_height_pt / rendered.height_pt).min(1.0)
+    } else {
+        1.0
+    };
+    (rendered.width_pt * scale, rendered.height_pt * scale)
 }
 
 #[command]
 pub async fn render_markdown_to_pdf_preview(markdown: String) -> Result<String, String> {
-    let blocks = parse_markdown_blocks(&markdown);
     let output_path = build_preview_path();
-    let bytes = build_preview_pdf(&blocks)?;
+    let bytes = render_markdown_preview_pdf_bytes(&markdown)?;
 
     fs::write(&output_path, &bytes)
         .map_err(|e| format!("プレビューPDFの書き込みに失敗しました: {e}"))?;
@@ -90,36 +170,658 @@ pub async fn render_markdown_to_pdf_preview(markdown: String) -> Result<String, 
     Ok(output_path.to_string_lossy().to_string())
 }
 
+pub fn render_markdown_preview_pdf_bytes(markdown: &str) -> Result<Vec<u8>, String> {
+    let blocks = parse_markdown_blocks(markdown);
+    build_preview_pdf(&blocks)
+}
+
+#[command]
+pub async fn render_markdown_to_html_preview(markdown: String) -> Result<String, String> {
+    let blocks = parse_markdown_blocks(&markdown);
+    Ok(build_preview_html(&blocks))
+}
+
 fn build_preview_path() -> PathBuf {
     std::env::temp_dir().join(format!("miniPDF-preview-{}.pdf", Uuid::new_v4()))
 }
 
+fn build_preview_html(blocks: &[MarkdownBlock]) -> String {
+    let mut pages: Vec<Vec<String>> = vec![Vec::new()];
+    let mut current_height = 0.0_f64;
+    let page_limit = 732.0_f64;
+
+    for block in blocks {
+        match block {
+            MarkdownBlock::Blockquote(lines) => {
+                for (html, est_h) in render_blockquote_html_chunks(lines, page_limit) {
+                    if !pages.last().unwrap().is_empty() && current_height + est_h > page_limit {
+                        pages.push(Vec::new());
+                        current_height = 0.0;
+                    }
+                    pages.last_mut().unwrap().push(html);
+                    current_height += est_h;
+                }
+            }
+            _ => {
+                let (html, est_h) = render_block_to_html(block);
+                if !pages.last().unwrap().is_empty() && current_height + est_h > page_limit {
+                    pages.push(Vec::new());
+                    current_height = 0.0;
+                }
+                pages.last_mut().unwrap().push(html);
+                current_height += est_h;
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("<style>");
+    out.push_str(r#"
+      @page { size: A4; margin: 0; }
+      :root {
+        --page-w: 595pt;
+        --page-h: 842pt;
+        --page-pad: 40pt;
+        --ink: #1d2330;
+        --muted: #5e6472;
+        --bg: #d7d7d7;
+        --paper: #fff;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; color: var(--ink); font-family: "Noto Sans JP", "Yu Gothic UI", "Hiragino Sans", sans-serif; }
+      body { background: var(--bg); padding: 16pt 0 32pt; }
+      .page {
+        width: var(--page-w);
+        min-height: var(--page-h);
+        margin: 0 auto 16pt;
+        padding: var(--page-pad);
+        background: var(--paper);
+        box-shadow: 0 10px 24px rgba(0,0,0,.16);
+        overflow: hidden;
+        break-after: page;
+        page-break-after: always;
+      }
+      .page:last-child { break-after: auto; page-break-after: auto; }
+      h1 { font-size: 24pt; font-weight: 700; margin: 0 0 14pt; line-height: 1.2; }
+      h2 { font-size: 20pt; font-weight: 700; margin: 18pt 0 12pt; line-height: 1.25; }
+      h3 { font-size: 18pt; font-weight: 700; margin: 14pt 0 10pt; line-height: 1.25; }
+      p { margin: 0 0 10pt; line-height: 1.5; font-size: 11.5pt; }
+      ul, ol { margin: 0 0 10pt 1.4em; padding: 0; line-height: 1.5; font-size: 11.5pt; }
+      li { margin: 0 0 3pt; }
+      blockquote {
+        margin: 0 0 10pt;
+        padding: 10pt 12pt;
+        border-left: 6px solid #7d92cf;
+        background: #f5f7fc;
+        line-height: 1.45;
+        font-size: 11.5pt;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      blockquote .blockquote-line {
+        margin: 0 0 4pt;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      blockquote .blockquote-line:last-child {
+        margin-bottom: 0;
+      }
+      blockquote .blockquote-math {
+        margin: 6pt 0;
+        text-align: center;
+        font-family: "Cambria Math", "Times New Roman", serif;
+        font-style: italic;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      blockquote .blockquote-code {
+        margin: 6pt 0;
+        padding: 8pt 10pt;
+        background: #eef2f8;
+        border: 1px solid #d7deea;
+        border-radius: 6px;
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      strong { font-weight: 700; }
+      em { font-style: italic; }
+      .link { color: #2156d1; text-decoration: underline; }
+      .math { font-family: "Cambria Math", "Times New Roman", serif; font-style: italic; }
+      .math-block {
+        margin: 0 0 10pt;
+        padding: 12pt 14pt;
+        background: #f6f8ff;
+        border: 1px solid #d7def1;
+        border-radius: 8px;
+        font-family: "Cambria Math", "Times New Roman", serif;
+      }
+      code {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        background: #eef2f8;
+        padding: 0.12em 0.28em;
+        border-radius: 4px;
+      }
+      pre {
+        margin: 0 0 10pt;
+        padding: 10pt 12pt;
+        background: #f4f6fa;
+        border: 1px solid #dde3ef;
+        border-radius: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      pre code { background: transparent; padding: 0; }
+      table { width: 100%; border-collapse: collapse; margin: 0 0 10pt; break-inside: avoid; page-break-inside: avoid; font-size: 10.5pt; }
+      thead { display: table-header-group; }
+      tbody { display: table-row-group; }
+      tr { break-inside: avoid; page-break-inside: avoid; }
+      th, td { border: 1px solid #adb5c7; padding: 6pt 8pt; text-align: left; vertical-align: top; }
+      th { background: #f1f4fb; }
+      .mermaid-frame {
+        margin: 8pt 0 10pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      img.mermaid {
+        max-width: 100%;
+        max-height: 260pt;
+        width: auto;
+        height: auto;
+        display: block;
+        margin: 0 auto;
+        object-fit: contain;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      .mermaid-fallback {
+        padding: 10pt 12pt;
+        border: 1px dashed #aab4cc;
+        background: #fafbfe;
+        margin: 0 0 10pt;
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      .mermaid-fallback .label { font-weight: 700; margin-bottom: 6px; }
+      .muted { color: var(--muted); }
+      hr { border: none; margin: 16pt 0; }
+      hr.hr-hyphen { border-top: 1.5px solid #b6c0cf; }
+      hr.hr-asterisk { border-top: 1.5px dashed #9daac0; }
+      hr.hr-underscore { border-top: 3px double #c0c9d8; }
+      a { color: #2156d1; }
+      @media print {
+        html, body { background: #fff; }
+        body { padding: 0; }
+        .page {
+          margin: 0;
+          box-shadow: none;
+          overflow: visible;
+          border: 0;
+        }
+        h1 { font-size: 24pt; }
+        h2 { font-size: 20pt; }
+        h3 { font-size: 18pt; }
+        p, ul, ol, table { font-size: 11.5pt; }
+        * {
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+        }
+      }
+    "#);
+    out.push_str("</style>");
+    for page in pages {
+        out.push_str("<section class=\"page\">");
+        for block in page {
+            out.push_str(&block);
+        }
+        out.push_str("</section>");
+    }
+    out
+}
+
+fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
+    match block {
+        MarkdownBlock::Heading { level, spans } => {
+            let tag = match level {
+                1 => "h1",
+                2 => "h2",
+                3 => "h3",
+                _ => "h4",
+            };
+            let est = if *level == 1 { 56.0 } else { 40.0 };
+            (format!("<{tag}>{}</{tag}>", render_spans_html(spans)), est)
+        }
+        MarkdownBlock::Paragraph(spans) => {
+            let text = render_spans_html(spans);
+            (format!("<p>{text}</p>"), 40.0 + (spans.len() as f64 * 8.0))
+        }
+        MarkdownBlock::Spacer { lines } => {
+            let height = (*lines as f64).max(1.0) * 14.0;
+            (
+                format!("<div class=\"blank-line-spacer\" style=\"height:{height}pt\"></div>"),
+                height,
+            )
+        }
+        MarkdownBlock::ListItem { indent, spans } => {
+            let pad = 1 + *indent as usize;
+            let text = render_spans_html(spans);
+            (
+                format!("<ul style=\"margin-left:{pad}em\"><li>{text}</li></ul>"),
+                28.0,
+            )
+        }
+        MarkdownBlock::OrderedListItem { n, indent, spans } => {
+            let pad = 1 + *indent as usize;
+            let text = render_spans_html(spans);
+            (
+                format!("<ol start=\"{n}\" style=\"margin-left:{pad}em\"><li>{text}</li></ol>"),
+                28.0,
+            )
+        }
+        MarkdownBlock::ThematicBreak(style) => {
+            let class = match style {
+                ThematicBreakStyle::Hyphen => "hr-hyphen",
+                ThematicBreakStyle::Asterisk => "hr-asterisk",
+                ThematicBreakStyle::Underscore => "hr-underscore",
+            };
+            (format!("<hr class=\"{class}\" />"), 18.0)
+        }
+        MarkdownBlock::Table(rows) => (render_table_html(rows), 48.0 + rows.len() as f64 * 28.0),
+        MarkdownBlock::CodeBlock { lang, code } => {
+            if lang == "mermaid" {
+                if let Ok(Some((png_data, _width, height))) = render_mermaid_png(code) {
+                    let encoded = general_purpose::STANDARD.encode(png_data);
+                    return (
+                        mermaid_preview_image_html(&encoded),
+                        mermaid_preview_height(height),
+                    );
+                }
+                return (mermaid_preview_fallback_html(), 96.0);
+            }
+            let escaped = escape_html(code);
+            (
+                format!("<pre><code>{escaped}</code></pre>"),
+                code.lines().count().max(1) as f64 * 20.0 + 28.0,
+            )
+        }
+        MarkdownBlock::DisplayMath(expr) => {
+            let escaped = escape_html(expr);
+            (
+                format!("<div class=\"math-block\">{escaped}</div>"),
+                46.0 + expr.lines().count().max(1) as f64 * 12.0,
+            )
+        }
+        MarkdownBlock::Blockquote(lines) => {
+            let html = render_blockquote_html_chunks(lines, f64::INFINITY)
+                .into_iter()
+                .next()
+                .map(|(html, _)| html)
+                .unwrap_or_else(|| "<blockquote></blockquote>".to_string());
+            (html, 48.0)
+        }
+    }
+}
+
+fn render_blockquote_html_chunks(lines: &[BlockquoteLine], page_limit: f64) -> Vec<(String, f64)> {
+    let mut chunks = Vec::new();
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut current_height = 32.0_f64;
+
+    for line in lines {
+        let (rendered, line_height) = render_blockquote_html_line(line);
+        if !current_lines.is_empty() && current_height + line_height > page_limit {
+            chunks.push((
+                format!("<blockquote>{}</blockquote>", current_lines.join("")),
+                current_height,
+            ));
+            current_lines.clear();
+            current_height = 32.0;
+        }
+
+        current_lines.push(rendered);
+        current_height += line_height;
+    }
+
+    if !current_lines.is_empty() {
+        chunks.push((
+            format!("<blockquote>{}</blockquote>", current_lines.join("")),
+            current_height,
+        ));
+    }
+
+    if chunks.is_empty() {
+        chunks.push(("<blockquote></blockquote>".to_string(), 32.0));
+    }
+
+    chunks
+}
+
+fn render_blockquote_html_line(line: &BlockquoteLine) -> (String, f64) {
+    match line {
+        BlockquoteLine::Text(spans) => {
+            let rendered = render_spans_html(spans);
+            (format!("<div class=\"blockquote-line\">{rendered}</div>"), 22.0)
+        }
+        BlockquoteLine::DisplayMath(expr) => (
+            format!("<div class=\"blockquote-math\">{}</div>", escape_html(expr)),
+            34.0,
+        ),
+        BlockquoteLine::CodeBlock { code, .. } => {
+            let escaped = escape_html(code);
+            let line_count = code.lines().count().max(1) as f64;
+            (
+                format!("<pre class=\"blockquote-code\"><code>{escaped}</code></pre>"),
+                22.0 + line_count * 18.0,
+            )
+        }
+    }
+}
+
+fn mermaid_preview_height(image_height: f64) -> f64 {
+    (image_height + 20.0)
+        .min(MERMAID_MAX_DISPLAY_HEIGHT)
+        .max(120.0)
+}
+
+fn fit_mermaid_image_to_page(image_width: f64, image_height: f64) -> (f64, f64, f64) {
+    let available_width = PAGE_WIDTH - 2.0 * MARGIN;
+    let natural_width = image_width.max(1.0) * MERMAID_PT_PER_PX;
+    let natural_height = image_height.max(1.0) * MERMAID_PT_PER_PX;
+    let scale = (available_width / natural_width)
+        .min(MERMAID_MAX_DISPLAY_HEIGHT / natural_height)
+        .min(1.0);
+    let draw_width = natural_width * scale;
+    let draw_height = natural_height * scale;
+    let draw_x = MARGIN + (available_width - draw_width) / 2.0;
+    (draw_x, draw_width, draw_height)
+}
+
+fn mermaid_preview_image_html(encoded_png: &str) -> String {
+    format!(
+        "<div class=\"mermaid-frame\"><img class=\"mermaid\" alt=\"Mermaid diagram\" src=\"data:image/png;base64,{encoded_png}\" /></div>"
+    )
+}
+
+fn mermaid_preview_fallback_html() -> String {
+    String::from(
+        "<div class=\"mermaid-fallback\"><div class=\"label\">Mermaid diagram preview unavailable</div><div class=\"muted\">Mermaid CLI を確認してください。</div></div>"
+    )
+}
+
+fn normalize_mermaid_jpeg_bytes(png_data: &[u8]) -> Result<Vec<u8>, String> {
+    let (jpeg, _, _) = normalize_png_to_jpeg_bytes(png_data)?;
+    Ok(jpeg)
+}
+
+fn normalize_png_to_jpeg_bytes(png_data: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let decoded = image::load_from_memory(png_data)
+        .map_err(|e| format!("PNG画像の正規化に失敗しました: {e}"))?;
+    let rgba = decoded.to_rgba8();
+    let (trimmed, width, height) = trim_transparent_border(&rgba);
+    let mut flattened = ImageBuffer::from_pixel(width, height, Rgb([255, 255, 255]));
+
+    for (x, y, pixel) in trimmed.enumerate_pixels() {
+        let src = pixel.0;
+        let alpha = src[3] as u16;
+        let inv_alpha = 255u16.saturating_sub(alpha);
+        let r = ((src[0] as u16 * alpha) + (255u16 * inv_alpha)) / 255;
+        let g = ((src[1] as u16 * alpha) + (255u16 * inv_alpha)) / 255;
+        let b = ((src[2] as u16 * alpha) + (255u16 * inv_alpha)) / 255;
+        flattened.put_pixel(x, y, Rgb([r as u8, g as u8, b as u8]));
+    }
+
+    let mut normalized = Vec::new();
+    DynamicImage::ImageRgb8(flattened)
+        .write_to(
+            &mut std::io::Cursor::new(&mut normalized),
+            ImageOutputFormat::Jpeg(90),
+        )
+        .map_err(|e| format!("PNG画像の再エンコードに失敗しました: {e}"))?;
+    Ok((normalized, width, height))
+}
+
+fn trim_transparent_border(image: &image::RgbaImage) -> (image::RgbaImage, u32, u32) {
+    let mut min_x = image.width();
+    let mut min_y = image.height();
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut found = false;
+
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[3] == 0 {
+            continue;
+        }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    if !found {
+        return (image.clone(), image.width(), image.height());
+    }
+
+    let width = (max_x - min_x + 1).max(1);
+    let height = (max_y - min_y + 1).max(1);
+    let cropped = image.view(min_x, min_y, width, height).to_image();
+    (cropped, width, height)
+}
+
+fn render_table_html(rows: &[Vec<Vec<InlineSpan>>]) -> String {
+    let mut out = String::from("<table><tbody>");
+    for row in rows {
+        out.push_str("<tr>");
+        for cell in row {
+            let cell_html = render_spans_html(cell);
+            let _ = write!(out, "<td>{cell_html}</td>");
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+fn render_spans_html(spans: &[InlineSpan]) -> String {
+    let mut out = String::new();
+    for span in spans {
+        let mut text = escape_html(&span.text).replace('\n', "<br />");
+        if span.style.link {
+            text = format!("<span class=\"link\">{text}</span>");
+        }
+        if span.style.math {
+            text = format!("<span class=\"math\">{text}</span>");
+        }
+        if span.style.code {
+            text = format!("<code>{text}</code>");
+        }
+        if span.style.bold {
+            text = format!("<strong>{text}</strong>");
+        }
+        if span.style.italic {
+            text = format!("<em>{text}</em>");
+        }
+        out.push_str(&text);
+    }
+    out
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn comrak_options() -> Options<'static> {
     let mut opts = Options::default();
+    opts.render.sourcepos = true;
     opts.extension.strikethrough = true;
     opts.extension.table = true;
     opts.extension.tagfilter = true;
     opts.extension.autolink = true;
     opts.extension.tasklist = true;
+    opts.extension.math_dollars = true;
+    opts.extension.math_code = true;
     opts
 }
 
 fn parse_markdown_blocks(markdown: &str) -> Vec<MarkdownBlock> {
+    let markdown = normalize_markdown_newlines(markdown);
+    let markdown = normalize_markdown_math_delimiters(&markdown);
+    let markdown = normalize_unclosed_mermaid_fences(&markdown);
+    let markdown_lines: Vec<&str> = markdown.lines().collect();
     let arena = Arena::new();
-    let root = parse_document(&arena, markdown, &comrak_options());
+    let root = parse_document(&arena, &markdown, &comrak_options());
     let mut blocks = Vec::new();
-    push_blocks_from_children(root, &mut blocks);
+    push_blocks_from_children(root, &mut blocks, &markdown_lines);
     blocks
 }
 
-fn push_blocks_from_children<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>) {
+fn normalize_markdown_newlines(markdown: &str) -> String {
+    markdown.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn normalize_markdown_math_delimiters(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut normalized = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if let Some(expr) = trimmed
+            .strip_prefix("\\(")
+            .and_then(|value| value.strip_suffix("\\)"))
+        {
+            let expr = expr.trim();
+            if !expr.is_empty() {
+                normalized.push("$$".to_string());
+                normalized.push(expr.to_string());
+                normalized.push("$$".to_string());
+                i += 1;
+                continue;
+            }
+        }
+
+        if trimmed == "\\[" {
+            let mut expr_lines = Vec::new();
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim() != "\\]" {
+                expr_lines.push(lines[j]);
+                j += 1;
+            }
+            if j < lines.len() {
+                let expr = expr_lines.join("\n").trim().to_string();
+                if !expr.is_empty() {
+                    normalized.push("$$".to_string());
+                    normalized.push(expr);
+                    normalized.push("$$".to_string());
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        normalized.push(line.to_string());
+        i += 1;
+    }
+
+    normalized.join("\n")
+}
+
+fn normalize_unclosed_mermaid_fences(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut normalized = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```mermaid") {
+            normalized.push(line.to_string());
+            i += 1;
+            let mut closed = false;
+
+            while i < lines.len() {
+                let next_line = lines[i];
+                let next_trimmed = next_line.trim_start();
+                if next_trimmed == "```" {
+                    normalized.push(next_line.to_string());
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                if is_markdown_heading_line(next_line) {
+                    normalized.push("```".to_string());
+                    closed = true;
+                    break;
+                }
+                normalized.push(next_line.to_string());
+                i += 1;
+            }
+
+            if !closed {
+                normalized.push("```".to_string());
+            }
+            continue;
+        }
+
+        normalized.push(line.to_string());
+        i += 1;
+    }
+
+    normalized.join("\n")
+}
+
+fn is_markdown_heading_line(line: &str) -> bool {
+    matches!(
+        line.trim_start(),
+        s if s.starts_with("# ") || s.starts_with("## ") || s.starts_with("### ") || s.starts_with("#### ") || s.starts_with("##### ") || s.starts_with("###### ")
+    )
+}
+
+fn push_blocks_from_children<'a>(
+    node: &'a AstNode<'a>,
+    blocks: &mut Vec<MarkdownBlock>,
+    markdown_lines: &[&str],
+) {
+    let mut previous_end_line: Option<usize> = None;
     for child in node.children() {
-        push_block(child, blocks);
+        let sourcepos = child.data.borrow().sourcepos;
+        if let Some(prev_end_line) = previous_end_line {
+            let blank_lines = sourcepos
+                .start
+                .line
+                .saturating_sub(prev_end_line.saturating_add(1));
+            if blank_lines > 0 {
+                // why: 連続空行をそのまま全部余白化すると、テスト用 fixture の大きな空白塊が
+                //      過剰に広がってしまう。空行は効かせつつ、見た目は2行までに抑える。
+                // alt: 連続空行をすべて余白化する（長い空白がページレイアウトを壊しやすい）
+                blocks.push(MarkdownBlock::Spacer {
+                    lines: blank_lines.min(2),
+                });
+            }
+        }
+        push_block(child, blocks, markdown_lines);
+        previous_end_line = Some(sourcepos.end.line);
     }
 }
 
 /// `List` ノードをフラットな `ListItem` / `OrderedListItem` に展開する（子 `List` は `indent+1`）。
-fn flatten_list_blocks<'a>(list_node: &'a AstNode<'a>, indent: u8, blocks: &mut Vec<MarkdownBlock>) {
+fn flatten_list_blocks<'a>(
+    list_node: &'a AstNode<'a>,
+    indent: u8,
+    blocks: &mut Vec<MarkdownBlock>,
+    markdown_lines: &[&str],
+) {
     let NodeValue::List(list) = &list_node.data.borrow().value else {
         return;
     };
@@ -138,7 +840,12 @@ fn flatten_list_blocks<'a>(list_node: &'a AstNode<'a>, indent: u8, blocks: &mut 
                             }
                         }
                         NodeValue::List(_) => {
-                            flatten_list_blocks(child, indent.saturating_add(1), blocks);
+                            flatten_list_blocks(
+                                child,
+                                indent.saturating_add(1),
+                                blocks,
+                                markdown_lines,
+                            );
                         }
                         _ => {}
                     }
@@ -155,14 +862,15 @@ fn flatten_list_blocks<'a>(list_node: &'a AstNode<'a>, indent: u8, blocks: &mut 
                     match &child.data.borrow().value {
                         NodeValue::Paragraph => {
                             let spans = paragraph_spans(child);
-                            blocks.push(MarkdownBlock::OrderedListItem {
-                                n,
-                                indent,
-                                spans,
-                            });
+                            blocks.push(MarkdownBlock::OrderedListItem { n, indent, spans });
                         }
                         NodeValue::List(_) => {
-                            flatten_list_blocks(child, indent.saturating_add(1), blocks);
+                            flatten_list_blocks(
+                                child,
+                                indent.saturating_add(1),
+                                blocks,
+                                markdown_lines,
+                            );
                         }
                         _ => {}
                     }
@@ -173,37 +881,42 @@ fn flatten_list_blocks<'a>(list_node: &'a AstNode<'a>, indent: u8, blocks: &mut 
     }
 }
 
-fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>) {
+fn push_block<'a>(
+    node: &'a AstNode<'a>,
+    blocks: &mut Vec<MarkdownBlock>,
+    markdown_lines: &[&str],
+) {
     match &node.data.borrow().value {
-        NodeValue::Document => push_blocks_from_children(node, blocks),
+        NodeValue::Document => push_blocks_from_children(node, blocks, markdown_lines),
         NodeValue::FrontMatter(_) => {}
         NodeValue::BlockQuote => {
-            let mut paras: Vec<Vec<InlineSpan>> = Vec::new();
-            collect_blockquote_content(node, &mut paras);
-            for p in paras {
-                if !p.is_empty() {
-                    blocks.push(MarkdownBlock::Blockquote(p));
-                }
+            let mut lines = Vec::new();
+            collect_blockquote_content(node, 0, &mut lines, markdown_lines);
+            if !lines.is_empty() {
+                blocks.push(MarkdownBlock::Blockquote(lines));
             }
         }
         NodeValue::MultilineBlockQuote(_) => {
-            let mut paras: Vec<Vec<InlineSpan>> = Vec::new();
-            collect_blockquote_content(node, &mut paras);
-            for p in paras {
-                if !p.is_empty() {
-                    blocks.push(MarkdownBlock::Blockquote(p));
-                }
+            let mut lines = Vec::new();
+            collect_blockquote_content(node, 0, &mut lines, markdown_lines);
+            if !lines.is_empty() {
+                blocks.push(MarkdownBlock::Blockquote(lines));
             }
         }
         NodeValue::List(_) => {
-            flatten_list_blocks(node, 0, blocks);
+            flatten_list_blocks(node, 0, blocks, markdown_lines);
         }
         NodeValue::Paragraph => {
-            let spans = paragraph_spans(node);
-            if !spans.is_empty() {
-                blocks.push(MarkdownBlock::Paragraph(spans));
+            if let Some(expr) = paragraph_display_math_expr(node) {
+                blocks.push(MarkdownBlock::DisplayMath(expr));
+            } else {
+                let spans = paragraph_spans(node);
+                if !spans.is_empty() {
+                    blocks.push(MarkdownBlock::Paragraph(spans));
+                }
             }
         }
+        NodeValue::Math(math) => push_math_block(math, blocks),
         NodeValue::Heading(h) => {
             let spans = paragraph_spans(node);
             if !spans.is_empty() {
@@ -222,7 +935,18 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>) {
             }
         }
         NodeValue::ThematicBreak => {
-            blocks.push(MarkdownBlock::ThematicBreak);
+            let source_line = node
+                .data
+                .borrow()
+                .sourcepos
+                .start
+                .line
+                .saturating_sub(1);
+            let style = markdown_lines
+                .get(source_line)
+                .map(|line| classify_thematic_break_style(line))
+                .unwrap_or(ThematicBreakStyle::Hyphen);
+            blocks.push(MarkdownBlock::ThematicBreak(style));
         }
         NodeValue::HtmlBlock(nb) => {
             let t = nb.literal.trim();
@@ -235,15 +959,12 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>) {
         NodeValue::Item(_) => {
             let spans = item_first_paragraph_spans(node);
             if !spans.is_empty() {
-                blocks.push(MarkdownBlock::ListItem {
-                    indent: 0,
-                    spans,
-                });
+                blocks.push(MarkdownBlock::ListItem { indent: 0, spans });
             }
         }
         _ => {
             for c in node.children() {
-                push_block(c, blocks);
+                push_block(c, blocks, markdown_lines);
             }
         }
     }
@@ -292,38 +1013,61 @@ fn table_from_node<'a>(table: &'a AstNode<'a>) -> Option<MarkdownBlock> {
     }
 }
 
-fn collect_blockquote_content<'a>(node: &'a AstNode<'a>, paras: &mut Vec<Vec<InlineSpan>>) {
+fn collect_blockquote_content<'a>(
+    node: &'a AstNode<'a>,
+    level: u8,
+    out: &mut Vec<BlockquoteLine>,
+    markdown_lines: &[&str],
+) {
     for c in node.children() {
         match &c.data.borrow().value {
-            NodeValue::Paragraph => paras.push(paragraph_spans(c)),
+            NodeValue::Paragraph => {
+                if let Some(expr) = paragraph_display_math_expr(c) {
+                    append_blockquote_math(out, expr);
+                } else {
+                    append_blockquote_text(out, level, paragraph_spans(c));
+                }
+            }
             NodeValue::BlockQuote | NodeValue::MultilineBlockQuote(_) => {
-                collect_blockquote_content(c, paras);
+                collect_blockquote_content(c, level.saturating_add(1), out, markdown_lines);
             }
             NodeValue::List(_) => {
                 let mut flat = Vec::new();
-                flatten_list_blocks(c, 0, &mut flat);
+                flatten_list_blocks(c, 0, &mut flat, markdown_lines);
                 for b in flat {
                     match b {
                         MarkdownBlock::ListItem { indent, mut spans } => {
                             if spans.is_empty() {
                                 continue;
                             }
-                            let mut prefix = Vec::new();
-                            let pad = "  ".repeat(1 + indent as usize);
-                            InlineSpan::push(&mut prefix, &format!("{pad}• "), TextStyle::default());
-                            prefix.append(&mut spans);
-                            paras.push(prefix);
+                            let mut line = Vec::new();
+                            if level > 0 {
+                                let prefix = format!("{} ", "> ".repeat(level as usize));
+                                InlineSpan::push(&mut line, &prefix, TextStyle::default());
+                            }
+                            let pad = "  ".repeat(indent as usize);
+                            InlineSpan::push(&mut line, &format!("{pad}• "), TextStyle::default());
+                            line.append(&mut spans);
+                            append_blockquote_text(out, level, line);
                         }
-                        MarkdownBlock::OrderedListItem { n, indent, mut spans } => {
-                            let mut prefix = Vec::new();
-                            let pad = "  ".repeat(1 + indent as usize);
+                        MarkdownBlock::OrderedListItem {
+                            n,
+                            indent,
+                            mut spans,
+                        } => {
+                            let mut line = Vec::new();
+                            if level > 0 {
+                                let prefix = format!("{} ", "> ".repeat(level as usize));
+                                InlineSpan::push(&mut line, &prefix, TextStyle::default());
+                            }
+                            let pad = "  ".repeat(indent as usize);
                             InlineSpan::push(
-                                &mut prefix,
+                                &mut line,
                                 &format!("{pad}{n}. "),
                                 TextStyle::default(),
                             );
-                            prefix.append(&mut spans);
-                            paras.push(prefix);
+                            line.append(&mut spans);
+                            append_blockquote_text(out, level, line);
                         }
                         _ => {}
                     }
@@ -331,18 +1075,20 @@ fn collect_blockquote_content<'a>(node: &'a AstNode<'a>, paras: &mut Vec<Vec<Inl
             }
             _ => {
                 let mut tmp = Vec::new();
-                push_block(c, &mut tmp);
+                push_block(c, &mut tmp, markdown_lines);
                 for b in tmp {
                     match b {
-                        MarkdownBlock::Paragraph(s) | MarkdownBlock::Blockquote(s) => {
-                            if !s.is_empty() {
-                                paras.push(s);
-                            }
+                        MarkdownBlock::Paragraph(s) => {
+                            append_blockquote_text(out, level, s);
                         }
-                        MarkdownBlock::Heading { spans, .. }
-                            if !spans.is_empty() =>
-                        {
-                            paras.push(spans);
+                        MarkdownBlock::Blockquote(s) => {
+                            out.extend(s);
+                        }
+                        MarkdownBlock::CodeBlock { lang, code } => {
+                            append_blockquote_code_block(out, lang, code);
+                        }
+                        MarkdownBlock::Heading { spans, .. } if !spans.is_empty() => {
+                            append_blockquote_text(out, level, spans);
                         }
                         _ => {}
                     }
@@ -350,6 +1096,38 @@ fn collect_blockquote_content<'a>(node: &'a AstNode<'a>, paras: &mut Vec<Vec<Inl
             }
         }
     }
+}
+
+fn append_blockquote_text(out: &mut Vec<BlockquoteLine>, level: u8, mut spans: Vec<InlineSpan>) {
+    if spans.is_empty() {
+        return;
+    }
+    if level > 0 {
+        let prefix = format!("{} ", "> ".repeat(level as usize));
+        let mut prefixed = Vec::new();
+        InlineSpan::push(&mut prefixed, &prefix, TextStyle::default());
+        prefixed.append(&mut spans);
+        spans = prefixed;
+    }
+    for line in layout_spans_lines(&spans, blockquote_wrap_cols()) {
+        out.push(BlockquoteLine::Text(line));
+    }
+}
+
+fn append_blockquote_math(out: &mut Vec<BlockquoteLine>, expr: String) {
+    let expr = expr.trim().to_string();
+    if expr.is_empty() {
+        return;
+    }
+    out.push(BlockquoteLine::DisplayMath(expr));
+}
+
+fn append_blockquote_code_block(out: &mut Vec<BlockquoteLine>, _lang: String, code: String) {
+    let code = code.trim_end_matches('\n').to_string();
+    if code.is_empty() {
+        return;
+    }
+    out.push(BlockquoteLine::CodeBlock { code });
 }
 
 fn paragraph_spans<'a>(p: &'a AstNode<'a>) -> Vec<InlineSpan> {
@@ -381,9 +1159,19 @@ fn collect_inline_spans<'a>(
     out: &mut Vec<InlineSpan>,
 ) {
     match &node.data.borrow().value {
-        NodeValue::Text(t) => InlineSpan::push(out, t, inherited),
+        NodeValue::Text(t) => push_text_with_math(out, t, inherited),
         NodeValue::SoftBreak => InlineSpan::push(out, "\n", inherited),
         NodeValue::LineBreak => InlineSpan::push(out, "\n", inherited),
+        NodeValue::Math(math) => {
+            InlineSpan::push(
+                out,
+                &math.literal,
+                TextStyle {
+                    math: true,
+                    ..inherited
+                },
+            );
+        }
         NodeValue::Code(NodeCode { literal, .. }) => {
             InlineSpan::push(
                 out,
@@ -392,6 +1180,8 @@ fn collect_inline_spans<'a>(
                     bold: false,
                     italic: false,
                     code: true,
+                    link: inherited.link,
+                    math: inherited.math,
                 },
             );
         }
@@ -400,6 +1190,8 @@ fn collect_inline_spans<'a>(
                 bold: true,
                 italic: inherited.italic,
                 code: false,
+                link: inherited.link,
+                math: inherited.math,
             };
             for c in node.children() {
                 collect_inline_spans(c, st, out);
@@ -410,6 +1202,8 @@ fn collect_inline_spans<'a>(
                 bold: inherited.bold,
                 italic: true,
                 code: false,
+                link: inherited.link,
+                math: inherited.math,
             };
             for c in node.children() {
                 collect_inline_spans(c, st, out);
@@ -421,8 +1215,13 @@ fn collect_inline_spans<'a>(
             }
         }
         NodeValue::Link(_) | NodeValue::WikiLink(_) => {
+            let st = TextStyle {
+                link: true,
+                math: inherited.math,
+                ..inherited
+            };
             for c in node.children() {
-                collect_inline_spans(c, inherited, out);
+                collect_inline_spans(c, st, out);
             }
         }
         NodeValue::Image(link) => {
@@ -437,11 +1236,7 @@ fn collect_inline_spans<'a>(
             } else {
                 alt
             };
-            InlineSpan::push(
-                out,
-                &format!("[画像: {label}]"),
-                inherited,
-            );
+            InlineSpan::push(out, &format!("[画像: {label}]"), inherited);
         }
         NodeValue::HtmlInline(raw) | NodeValue::Raw(raw) => InlineSpan::push(out, raw, inherited),
         NodeValue::TaskItem(checked) => {
@@ -467,6 +1262,525 @@ fn collect_inline_spans<'a>(
     }
 }
 
+fn push_text_with_math(out: &mut Vec<InlineSpan>, text: &str, inherited: TextStyle) {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some((pos, delimiter)) = next_math_delimiter(rest) else {
+            InlineSpan::push(out, rest, inherited);
+            return;
+        };
+
+        if pos > 0 {
+            InlineSpan::push(out, &rest[..pos], inherited);
+        }
+
+        let after = &rest[pos..];
+        let handled = match delimiter {
+            MathDelimiter::DisplayDollar => after[2..].find("$$").map(|end| {
+                let expr = after[2..2 + end].trim();
+                if !expr.is_empty() {
+                    InlineSpan::push(
+                        out,
+                        expr,
+                        TextStyle {
+                            math: true,
+                            ..inherited
+                        },
+                    );
+                }
+                2 + end + 2
+            }),
+            MathDelimiter::InlineDollar => after[1..].find('$').map(|end| {
+                let expr = after[1..1 + end].trim();
+                if !expr.is_empty() {
+                    InlineSpan::push(
+                        out,
+                        expr,
+                        TextStyle {
+                            math: true,
+                            ..inherited
+                        },
+                    );
+                }
+                1 + end + 1
+            }),
+        };
+
+        if let Some(advance) = handled {
+            rest = &after[advance..];
+            continue;
+        }
+
+        InlineSpan::push(out, &rest[pos..], inherited);
+        return;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MathDelimiter {
+    DisplayDollar,
+    InlineDollar,
+}
+
+fn next_math_delimiter(rest: &str) -> Option<(usize, MathDelimiter)> {
+    let mut best: Option<(usize, MathDelimiter)> = None;
+    for (pattern, delimiter) in [
+        ("$$", MathDelimiter::DisplayDollar),
+        ("$", MathDelimiter::InlineDollar),
+    ] {
+        if let Some(pos) = rest.find(pattern) {
+            let should_replace = match best {
+                None => true,
+                Some((best_pos, _)) => pos < best_pos,
+            };
+            if should_replace {
+                best = Some((pos, delimiter));
+            }
+        }
+    }
+    best
+}
+
+fn paragraph_display_math_expr<'a>(node: &'a AstNode<'a>) -> Option<String> {
+    let raw_text = paragraph_raw_text(node);
+    let trimmed = raw_text.trim();
+    if let Some(expr) = trimmed.strip_prefix("\\[").and_then(|value| value.strip_suffix("\\]")) {
+        let expr = expr.trim();
+        if !expr.is_empty() {
+            return Some(expr.to_string());
+        }
+    }
+
+    let mut expr = String::new();
+    let mut saw_math = false;
+    for child in node.children() {
+        match &child.data.borrow().value {
+            NodeValue::Math(math) if math.display_math => {
+                expr.push_str(math.literal.trim());
+                saw_math = true;
+            }
+            NodeValue::SoftBreak | NodeValue::LineBreak => {
+                if saw_math {
+                    expr.push('\n');
+                }
+            }
+            NodeValue::Text(t) if t.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    if saw_math {
+        let trimmed = expr.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else {
+        None
+    }
+}
+
+fn paragraph_raw_text<'a>(node: &'a AstNode<'a>) -> String {
+    let mut out = String::new();
+    for child in node.children() {
+        match &child.data.borrow().value {
+            NodeValue::Text(t) => out.push_str(t),
+            NodeValue::SoftBreak | NodeValue::LineBreak => out.push('\n'),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn format_math_expression(expr: &str) -> Vec<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return vec![String::new()];
+    }
+    if let Some(lines) = format_math_environment(trimmed, "bmatrix", "[", "]") {
+        return lines;
+    }
+    if let Some(lines) = format_math_environment(trimmed, "pmatrix", "(", ")") {
+        return lines;
+    }
+    if let Some(lines) = format_cases_environment(trimmed) {
+        return lines;
+    }
+
+    let lines: Vec<String> = trimmed
+        .lines()
+        .map(|line| simplify_math_line(line.trim()))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        vec![simplify_math_line(trimmed)]
+    } else {
+        lines
+    }
+}
+
+fn format_math_environment(expr: &str, env_name: &str, open: &str, close: &str) -> Option<Vec<String>> {
+    let begin = format!("\\begin{{{env_name}}}");
+    let end = format!("\\end{{{env_name}}}");
+    let start = expr.find(&begin)?;
+    let finish = expr.rfind(&end)?;
+    if finish <= start {
+        return None;
+    }
+    let prefix = expr[..start].trim();
+    let body = expr[start + begin.len()..finish].trim();
+    let rows = split_math_rows(body);
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    if !prefix.is_empty() {
+        out.push(simplify_math_line(prefix));
+    }
+    for (idx, row) in rows.iter().enumerate() {
+        let cells = row
+            .split('&')
+            .map(|cell| simplify_math_line(cell.trim()))
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        let row_text = cells.join("  ");
+        if idx == 0 {
+            out.push(format!("{open} {row_text}"));
+        } else if idx + 1 == rows.len() {
+            out.push(format!("  {row_text} {close}"));
+        } else {
+            out.push(format!("  {row_text}"));
+        }
+    }
+    Some(out)
+}
+
+fn format_cases_environment(expr: &str) -> Option<Vec<String>> {
+    let begin = "\\begin{cases}";
+    let end = "\\end{cases}";
+    let start = expr.find(begin)?;
+    let finish = expr.rfind(end)?;
+    if finish <= start {
+        return None;
+    }
+    let prefix = expr[..start].trim();
+    let body = expr[start + begin.len()..finish].trim();
+    let rows = split_math_rows(body);
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    if !prefix.is_empty() {
+        out.push(simplify_math_line(prefix));
+    }
+    out.push("{".to_string());
+    for row in rows {
+        out.push(format!("  {}", simplify_math_line(&row.replace('&', " "))));
+    }
+    out.push("}".to_string());
+    Some(out)
+}
+
+fn split_math_rows(body: &str) -> Vec<String> {
+    body.split("\\\\")
+        .map(|row| row.trim().to_string())
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+fn simplify_math_line(line: &str) -> String {
+    let mut s = line.to_string();
+    s = s.replace("\\displaystyle", "");
+    s = s.replace("\\left", "");
+    s = s.replace("\\right", "");
+    s = s.replace("\\lVert", "‖");
+    s = s.replace("\\rVert", "‖");
+    s = s.replace("\\lvert", "|");
+    s = s.replace("\\rvert", "|");
+    s = s.replace("\\|", "‖");
+    s = s.replace("\\vert", "|");
+    s = s.replace("\\cdot", "·");
+    s = s.replace("\\times", "×");
+    s = s.replace("\\sum", "∑");
+    s = s.replace("\\int", "∫");
+    s = s.replace("\\sqrt", "√");
+    s = s.replace("\\infty", "∞");
+    s = s.replace("\\nabla", "∇");
+    s = s.replace("\\pi", "π");
+    s = s.replace("\\alpha", "α");
+    s = s.replace("\\beta", "β");
+    s = s.replace("\\gamma", "γ");
+    s = s.replace("\\rho", "ρ");
+    s = s.replace("\\varepsilon", "ε");
+    s = s.replace("\\le", "≤");
+    s = s.replace("\\ge", "≥");
+    s = s.replace("\\neq", "≠");
+    s = s.replace("\\mid", "|");
+    s = s.replace("\\to", "→");
+    s = s.replace("\\mathrm", "");
+    s = s.replace("\\mathbf", "");
+    s = s.replace("\\text", "");
+    s = s.replace("\\,", " ");
+    s = s.replace("\\quad", "  ");
+    s = replace_frac_notation(&s);
+    s = simplify_sup_subscripts(&s);
+    s = s.replace('{', "");
+    s = s.replace('}', "");
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn replace_frac_notation(input: &str) -> String {
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(pos) = rest.find("\\frac{") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 5..];
+        if let Some((num, after_num)) = take_braced(after) {
+            if let Some((den, after_den)) = take_braced(after_num) {
+                out.push('(');
+                out.push_str(&simplify_math_line(num));
+                out.push_str(")/(");
+                out.push_str(&simplify_math_line(den));
+                out.push(')');
+                rest = after_den;
+                continue;
+            }
+        }
+        out.push_str("\\frac{");
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn take_braced(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '{' => {
+                depth += 1;
+                if start.is_none() {
+                    start = Some(idx + 1);
+                }
+            }
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let start = start?;
+                    return Some((&input[start..idx], &input[idx + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn simplify_sup_subscripts(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '^' | '_' => {
+                let is_super = chars[i] == '^';
+                i += 1;
+                if i >= chars.len() {
+                    break;
+                }
+                let token = if chars[i] == '{' {
+                    let mut depth = 1usize;
+                    let start = i + 1;
+                    i += 1;
+                    while i < chars.len() && depth > 0 {
+                        match chars[i] {
+                            '{' => depth += 1,
+                            '}' => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let end = i.saturating_sub(1);
+                    chars[start..end].iter().collect::<String>()
+                } else {
+                    let token = chars[i].to_string();
+                    i += 1;
+                    token
+                };
+                let mapped = if is_super {
+                    token.chars().map(super_script_char).collect::<String>()
+                } else {
+                    token.chars().map(sub_script_char).collect::<String>()
+                };
+                if mapped.is_empty() {
+                    out.push_str(&token);
+                } else {
+                    out.push_str(&mapped);
+                }
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn super_script_char(ch: char) -> char {
+    match ch {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'n' => 'ⁿ',
+        'i' => 'ⁱ',
+        _ => ch,
+    }
+}
+
+fn sub_script_char(ch: char) -> char {
+    match ch {
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
+        'a' => 'ₐ',
+        'e' => 'ₑ',
+        'h' => 'ₕ',
+        'i' => 'ᵢ',
+        'j' => 'ⱼ',
+        'k' => 'ₖ',
+        'l' => 'ₗ',
+        'm' => 'ₘ',
+        'n' => 'ₙ',
+        'o' => 'ₒ',
+        'p' => 'ₚ',
+        'r' => 'ᵣ',
+        's' => 'ₛ',
+        't' => 'ₜ',
+        'u' => 'ᵤ',
+        'v' => 'ᵥ',
+        'x' => 'ₓ',
+        _ => ch,
+    }
+}
+
+fn math_display_width(expr: &str) -> usize {
+    let base = expr.chars().map(char_display_width).sum::<usize>();
+    base.max(4)
+}
+
+fn render_math_with_katex(
+    expr: &str,
+    display_mode: bool,
+) -> Result<Option<MathRenderImage>, String> {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("render_katex_math.cjs");
+    if !script_path.exists() {
+        return Ok(None);
+    }
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let normalized_expr = normalize_math_for_katex(expr);
+    let encoded = general_purpose::STANDARD.encode(normalized_expr.as_bytes());
+    let output = Command::new("node")
+        .current_dir(repo_root)
+        .arg(&script_path)
+        .arg(encoded)
+        .arg(if display_mode { "1" } else { "0" })
+        .output()
+        .map_err(|e| format!("KaTeXレンダラの起動に失敗しました: {e}"))?;
+
+    if !output.status.success() {
+        log::warn!(
+            "KaTeX renderer failed: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(None);
+    }
+
+    let parsed: MathRenderResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("KaTeXレンダラの出力解析に失敗しました: {e}"))?;
+    let png_data = general_purpose::STANDARD
+        .decode(parsed.png)
+        .map_err(|e| format!("KaTeXレンダラのPNG復号に失敗しました: {e}"))?;
+    let (jpeg_data, width_px, height_px) = normalize_png_to_jpeg_bytes(&png_data)?;
+    let device_pixel_ratio = parsed.device_pixel_ratio.max(1.0);
+    Ok(Some(MathRenderImage {
+        jpeg_data,
+        width_pt: (width_px as f64 / device_pixel_ratio) * MERMAID_PT_PER_PX,
+        height_pt: (height_px as f64 / device_pixel_ratio) * MERMAID_PT_PER_PX,
+        baseline_pt: (parsed.baseline_offset / device_pixel_ratio) * MERMAID_PT_PER_PX,
+    }))
+}
+
+fn normalize_math_for_katex(expr: &str) -> String {
+    let mut s = expr.to_string();
+    s = s.replace("\\left\\lVert", "‖");
+    s = s.replace("\\right\\rVert", "‖");
+    s = s.replace("\\left\\|", "‖");
+    s = s.replace("\\right\\|", "‖");
+    s = s.replace("\\lVert", "‖");
+    s = s.replace("\\rVert", "‖");
+    s = s.replace("\\Vert", "‖");
+    s = s.replace("\\lvert", "|");
+    s = s.replace("\\rvert", "|");
+    s = s.replace("\\vert", "|");
+    s = s.replace("\\|", "‖");
+    s
+}
+
+fn push_math_block(math: &NodeMath, blocks: &mut Vec<MarkdownBlock>) {
+    if math.display_math {
+        blocks.push(MarkdownBlock::DisplayMath(math.literal.clone()));
+    } else if !math.literal.trim().is_empty() {
+        let mut spans = Vec::new();
+        InlineSpan::push(
+            &mut spans,
+            &math.literal,
+            TextStyle {
+                math: true,
+                ..TextStyle::default()
+            },
+        );
+        blocks.push(MarkdownBlock::Paragraph(spans));
+    }
+}
+
 fn merge_adjacent_spans(spans: &mut Vec<InlineSpan>) {
     let mut i = 1usize;
     while i < spans.len() {
@@ -485,6 +1799,8 @@ struct PreviewFace {
     body_bold: Font,
     body_italic: Font,
     body_bold_italic: Font,
+    emoji: Option<Font>,
+    emoji_path: Option<PathBuf>,
     /// `NotoSansJP-Bold` が埋め込まれている（Helvetica 系で日本語太字にしない）
     has_custom_bold: bool,
 }
@@ -495,6 +1811,12 @@ impl PreviewFace {
         if style.code {
             if ascii_only(text) {
                 return Font::Courier;
+            }
+            return self.body.clone();
+        }
+        if style.math {
+            if ascii_only(text) {
+                return Font::TimesItalic;
             }
             return self.body.clone();
         }
@@ -532,6 +1854,31 @@ impl PreviewFace {
     }
 }
 
+fn is_potential_bold_face(face: &PreviewFace, style: TextStyle, text: &str) -> bool {
+    style.bold && !ascii_only(text) && !face.has_custom_bold
+}
+
+fn draw_fake_bold_text(
+    page: &mut OxidizePage,
+    text: &str,
+    font: Font,
+    size: f64,
+    x: f64,
+    y: f64,
+    fill: Color,
+) -> Result<(), String> {
+    let offsets = [0.0_f64, 0.18, 0.36];
+    for dx in offsets {
+        page.text()
+            .set_fill_color(fill)
+            .set_font(font.clone(), size)
+            .at(x + dx, y)
+            .write(text)
+            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+    }
+    Ok(())
+}
+
 fn ascii_only(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii())
 }
@@ -551,6 +1898,12 @@ fn make_preview_face(doc: &Document, body: Font) -> PreviewFace {
         } else {
             body.clone()
         },
+        emoji: if doc.has_custom_font(EMOJI_FONT) {
+            Some(Font::custom(EMOJI_FONT))
+        } else {
+            None
+        },
+        emoji_path: font_manager::get_font_path(EMOJI_FONT),
         has_custom_bold: has_bold,
     }
 }
@@ -558,17 +1911,19 @@ fn make_preview_face(doc: &Document, body: Font) -> PreviewFace {
 fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
     let mut doc = Document::new();
     font_manager::register_fonts_on_document(&mut doc)?;
+    let mut math_cache = MathRenderCache::default();
 
-    let body_font = if doc.has_custom_font(JP_SANS_FONT) {
-        Font::custom(JP_SANS_FONT)
-    } else {
-        log::warn!(
+    let body_font =
+        if doc.has_custom_font(JP_SANS_FONT) {
+            Font::custom(JP_SANS_FONT)
+        } else {
+            log::warn!(
             "プレビュー用に {} が埋め込めません。{} に NotoSansJP-Regular.ttf を置いてください。",
             JP_SANS_FONT,
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts").display()
         );
-        Font::Helvetica
-    };
+            Font::Helvetica
+        };
     let face = make_preview_face(&doc, body_font);
 
     let mut page = OxidizePage::new(PAGE_WIDTH, PAGE_HEIGHT);
@@ -583,8 +1938,17 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     3 => 18.0,
                     _ => 16.0,
                 };
-                let est = estimate_rich_block_height(spans, max_chars_for_font(font_size), font_size);
-                cursor_y = ensure_room(cursor_y, est + 8.0, &mut page, &mut doc);
+                let spacing_before = if *level == 1 { 12.0 } else { 8.0 };
+                let spacing_after = if *level == 1 { 10.0 } else { 8.0 };
+                let est =
+                    estimate_rich_block_height(spans, max_chars_for_font(font_size), font_size);
+                cursor_y = ensure_room(
+                    cursor_y,
+                    est + spacing_before + spacing_after,
+                    &mut page,
+                    &mut doc,
+                );
+                cursor_y -= spacing_before;
                 draw_rich_block(
                     &mut page,
                     spans,
@@ -592,31 +1956,36 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     font_size,
                     MARGIN,
                     &mut cursor_y,
-                    (font_size * 1.2).max(BASE_LINE_HEIGHT),
                     max_chars_for_font(font_size),
+                    &mut math_cache,
                 )?;
-                cursor_y -= 8.0;
+                cursor_y -= spacing_after;
             }
-            MarkdownBlock::Paragraph(spans) => {
-                let est = estimate_rich_block_height(spans, 90, 11.5);
-                cursor_y = ensure_room(cursor_y, est + 6.0, &mut page, &mut doc);
-                draw_rich_block(
-                    &mut page,
+        MarkdownBlock::Paragraph(spans) => {
+            let est = estimate_rich_block_height(spans, 90, 11.5);
+            cursor_y = ensure_room(cursor_y, est + 4.0, &mut page, &mut doc);
+            draw_rich_block(
+                &mut page,
                     spans,
                     &face,
                     11.5,
                     MARGIN,
                     &mut cursor_y,
-                    BASE_LINE_HEIGHT,
                     90,
-                )?;
-                cursor_y -= 6.0;
-            }
-            MarkdownBlock::ListItem { indent, spans } => {
-                let ind = *indent;
-                let bullet = if ind > 0 {
-                    format!("{}• ", "  ".repeat(ind as usize))
-                } else {
+                    &mut math_cache,
+            )?;
+            cursor_y -= 4.0;
+        }
+        MarkdownBlock::Spacer { lines } => {
+            let spacer_height = (*lines as f64).max(1.0) * BASE_LINE_HEIGHT;
+            cursor_y = ensure_room(cursor_y, spacer_height, &mut page, &mut doc);
+            cursor_y -= spacer_height;
+        }
+        MarkdownBlock::ListItem { indent, spans } => {
+            let ind = *indent;
+            let bullet = if ind > 0 {
+                format!("{}• ", "  ".repeat(ind as usize))
+            } else {
                     "• ".to_string()
                 };
                 let prefix_cols = unicode_display_width(bullet.as_str());
@@ -624,31 +1993,43 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 let est = estimate_rich_block_height(spans, budget, 11.0) + BASE_LINE_HEIGHT;
                 cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
                 let lines = layout_spans_lines(spans, budget);
+                let prefix_x = MARGIN + 4.0;
+                let content_x = list_item_content_x(&bullet, &face.body, 11.0);
                 let mut first = true;
                 for line in lines {
-                    let mut prefixed = Vec::new();
                     if first {
                         first = false;
-                        InlineSpan::push(&mut prefixed, &bullet, TextStyle::default());
-                    } else {
+                        let mut prefixed = Vec::new();
                         InlineSpan::push(
                             &mut prefixed,
-                            &" ".repeat(prefix_cols.max(1)),
+                            &bullet,
                             TextStyle::default(),
                         );
+                        prefixed.extend(line);
+                        draw_rich_line_segments(
+                            &mut page,
+                            &prefixed,
+                            &face,
+                            11.0,
+                            prefix_x,
+                            &mut cursor_y,
+                            BASE_LINE_HEIGHT,
+                            &mut math_cache,
+                        )?;
+                    } else {
+                        draw_rich_line_segments(
+                            &mut page,
+                            &line,
+                            &face,
+                            11.0,
+                            content_x,
+                            &mut cursor_y,
+                            BASE_LINE_HEIGHT,
+                            &mut math_cache,
+                        )?;
                     }
-                    prefixed.extend(line);
-                    draw_rich_line_segments(
-                        &mut page,
-                        &prefixed,
-                        &face,
-                        11.0,
-                        MARGIN + 4.0,
-                        &mut cursor_y,
-                        BASE_LINE_HEIGHT,
-                    )?;
                 }
-                cursor_y -= 2.0;
+                cursor_y -= 4.0;
             }
             MarkdownBlock::OrderedListItem { n, indent, spans } => {
                 let ind = *indent;
@@ -662,47 +2043,46 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 let est = estimate_rich_block_height(spans, budget, 11.0) + BASE_LINE_HEIGHT;
                 cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
                 let lines = layout_spans_lines(spans, budget);
-                let mut idx = 0;
+                let prefix_x = MARGIN + 4.0;
+                let content_x = list_item_content_x(&prefix, &face.body, 11.0);
+                let mut first = true;
                 for line in lines {
-                    let mut row = Vec::new();
-                    if idx == 0 {
+                    if first {
+                        first = false;
+                        let mut row = Vec::new();
                         InlineSpan::push(
                             &mut row,
                             &prefix,
                             TextStyle::default(),
                         );
-                        idx += 1;
+                        row.extend(line);
+                        draw_rich_line_segments(
+                            &mut page,
+                            &row,
+                            &face,
+                            11.0,
+                            prefix_x,
+                            &mut cursor_y,
+                            BASE_LINE_HEIGHT,
+                            &mut math_cache,
+                        )?;
                     } else {
-                        InlineSpan::push(
-                            &mut row,
-                            &" ".repeat(prefix_cols.max(1)),
-                            TextStyle::default(),
-                        );
+                        draw_rich_line_segments(
+                            &mut page,
+                            &line,
+                            &face,
+                            11.0,
+                            content_x,
+                            &mut cursor_y,
+                            BASE_LINE_HEIGHT,
+                            &mut math_cache,
+                        )?;
                     }
-                    row.extend(line);
-                    draw_rich_line_segments(
-                        &mut page,
-                        &row,
-                        &face,
-                        11.0,
-                        MARGIN + 4.0,
-                        &mut cursor_y,
-                        BASE_LINE_HEIGHT,
-                    )?;
                 }
-                cursor_y -= 2.0;
+                cursor_y -= 4.0;
             }
-            MarkdownBlock::ThematicBreak => {
-                let h = 22.0_f64;
-                cursor_y = ensure_room(cursor_y, h, &mut page, &mut doc);
-                let y = cursor_y - h * 0.45;
-                page.graphics()
-                    .set_stroke_color(Color::gray(0.72))
-                    .set_line_width(0.55)
-                    .move_to(MARGIN + 6.0, y)
-                    .line_to(PAGE_WIDTH - MARGIN - 6.0, y)
-                    .stroke();
-                cursor_y -= h;
+            MarkdownBlock::ThematicBreak(style) => {
+                cursor_y = draw_thematic_break(&mut page, cursor_y, *style, &mut doc);
             }
             MarkdownBlock::Table(rows) => {
                 let row_h = 16.0_f64;
@@ -710,113 +2090,145 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 let est = row_h * n as f64 + 16.0;
                 cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
                 draw_table(&mut page, rows, &face, &mut cursor_y, row_h)?;
-                cursor_y -= 6.0;
+                cursor_y -= 4.0;
             }
             MarkdownBlock::CodeBlock { lang, code } => {
                 if lang == "mermaid" {
                     if let Some((png_data, width, height)) = render_mermaid_png(code)? {
-                        let draw_width = PAGE_WIDTH - (MARGIN * 2.0);
-                        let aspect = if width > 0.0 { height / width } else { 1.0 };
-                        let draw_height = (draw_width * aspect).min(260.0).max(80.0);
+                        let jpeg_data = normalize_mermaid_jpeg_bytes(&png_data)?;
+                        let (draw_x, draw_width, draw_height) =
+                            fit_mermaid_image_to_page(width, height);
                         cursor_y = ensure_room(cursor_y, draw_height + 18.0, &mut page, &mut doc);
                         draw_image_on_page(
                             &mut page,
-                            &png_data,
-                            "png",
-                            MARGIN,
+                            &jpeg_data,
+                            "jpeg",
+                            draw_x,
                             cursor_y - draw_height,
                             draw_width,
                             draw_height,
                         )?;
-                        cursor_y -= draw_height + 10.0;
+                        cursor_y -= draw_height + 8.0;
                         continue;
                     }
                 }
 
-                let code_lines = wrap_code_lines(code, 88);
                 let lh = BASE_LINE_HEIGHT - 1.0;
-                let pad = 6.0;
+                let pad_x = 10.0;
+                let pad_y = 9.0;
                 let fs = 9.5;
-                let block_h = code_lines.len() as f64 * lh + pad * 2.0;
-                cursor_y = ensure_room(cursor_y, block_h + 10.0, &mut page, &mut doc);
-
-                let y_top = cursor_y;
-                let y_bottom = y_top - block_h;
-                page.graphics()
-                    .set_fill_color(Color::rgb(0.88, 0.89, 0.92))
-                    .rectangle(MARGIN, y_bottom, PAGE_WIDTH - 2.0 * MARGIN, block_h)
-                    .fill();
-
                 if lang == "mermaid" {
-                    let hint = "(Mermaid: MINIPDF_MERMAID_CLI、リポジトリの node_modules/.bin/mmdc、実行ファイル隣の mmdc、または PATH の mmdc が必要です)";
-                    let mut hy = y_top - pad - fs * 0.85;
+                    let hint = "Mermaid diagram preview unavailable";
+                    let detail = "MINIPDF_MERMAID_CLI / node_modules/.bin/mmdc / PATH を確認";
+                    let mut hy = cursor_y - pad_y - fs * 0.85;
+                    let label_font = face.body.clone();
                     page.text()
                         .set_fill_color(Color::rgb(0.05, 0.05, 0.07))
-                        .set_font(face.body.clone(), 8.5)
-                        .at(MARGIN + pad, hy)
+                        .set_font(label_font.clone(), 8.5)
+                        .at(MARGIN + pad_x, hy)
                         .write(hint)
                         .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
                     hy -= lh;
-                    for line in &code_lines {
-                        let line_font = if ascii_only(line) {
-                            Font::Courier
-                        } else {
-                            face.body.clone()
-                        };
-                        page.text()
-                            .set_fill_color(Color::rgb(0.05, 0.05, 0.07))
-                            .set_font(line_font, fs)
-                            .at(MARGIN + pad, hy)
-                            .write(line)
-                            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
-                        hy -= lh;
-                    }
-                    cursor_y = y_bottom - 6.0;
-                } else {
-                    let mut hy = y_top - pad - fs * 0.85;
-                    for line in &code_lines {
-                        let line_font = if ascii_only(line) {
-                            Font::Courier
-                        } else {
-                            face.body.clone()
-                        };
-                        page.text()
-                            .set_fill_color(Color::rgb(0.05, 0.05, 0.07))
-                            .set_font(line_font, fs)
-                            .at(MARGIN + pad, hy)
-                            .write(line)
-                            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
-                        hy -= lh;
-                    }
-                    cursor_y = y_bottom - 6.0;
+                    page.text()
+                        .set_fill_color(Color::rgb(0.25, 0.28, 0.35))
+                        .set_font(label_font, 8.0)
+                        .at(MARGIN + pad_x, hy)
+                        .write(detail)
+                        .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+                    cursor_y -= lh * 2.0 + 2.0;
                 }
+                let code_lines = wrap_code_lines(code, 88);
+                let whole_block_h = code_lines.len().max(1) as f64 * lh + pad_y * 2.0;
+                if code_block_fits_on_single_page(whole_block_h) {
+                    cursor_y = ensure_room(cursor_y, whole_block_h + 8.0, &mut page, &mut doc);
+                    let block_left = MARGIN + 4.0;
+                    let block_width = PAGE_WIDTH - 2.0 * MARGIN - 8.0;
+                    let block_bottom = cursor_y - whole_block_h;
+                    page.graphics()
+                        .set_fill_color(Color::rgb(0.965, 0.97, 0.985))
+                        .rectangle(block_left, block_bottom, block_width, whole_block_h)
+                        .fill();
+                    page.graphics()
+                        .set_stroke_color(Color::rgb(0.82, 0.86, 0.93))
+                        .set_line_width(0.75)
+                        .rectangle(block_left, block_bottom, block_width, whole_block_h)
+                        .stroke();
+                    let mut line_y = cursor_y - pad_y - fs * 0.85;
+                    for line in &code_lines {
+                        draw_code_block_line(
+                            &mut page,
+                            line,
+                            &face,
+                            fs,
+                            block_left + pad_x,
+                            line_y,
+                        )?;
+                        line_y -= lh;
+                    }
+                    cursor_y -= whole_block_h + 4.0;
+                } else {
+                    let mut idx = 0usize;
+                    while idx < code_lines.len() {
+                        let lines_remaining = code_lines.len() - idx;
+                        let available_body_height = (cursor_y - MARGIN - 4.0).max(lh + pad_y * 2.0);
+                        let lines_fit = ((available_body_height - pad_y * 2.0) / lh)
+                            .floor()
+                            .max(1.0) as usize;
+                        let chunk_len = lines_remaining.min(lines_fit);
+                        let chunk = &code_lines[idx..idx + chunk_len];
+                        let block_h = chunk.len().max(1) as f64 * lh + pad_y * 2.0;
+                        cursor_y = ensure_room(cursor_y, block_h + 8.0, &mut page, &mut doc);
+                        let block_left = MARGIN + 4.0;
+                        let block_width = PAGE_WIDTH - 2.0 * MARGIN - 8.0;
+                        let block_bottom = cursor_y - block_h;
+                        page.graphics()
+                            .set_fill_color(Color::rgb(0.965, 0.97, 0.985))
+                            .rectangle(block_left, block_bottom, block_width, block_h)
+                            .fill();
+                        page.graphics()
+                            .set_stroke_color(Color::rgb(0.82, 0.86, 0.93))
+                            .set_line_width(0.75)
+                            .rectangle(block_left, block_bottom, block_width, block_h)
+                            .stroke();
+                        let mut line_y = cursor_y - pad_y - fs * 0.85;
+                        for line in chunk {
+                            draw_code_block_line(
+                                &mut page,
+                                line,
+                                &face,
+                                fs,
+                                block_left + pad_x,
+                                line_y,
+                            )?;
+                            line_y -= lh;
+                        }
+                        cursor_y -= block_h + 4.0;
+                        idx += chunk_len;
+                    }
+                }
+                continue;
             }
-            MarkdownBlock::Blockquote(spans) => {
-                let lines = layout_spans_lines(spans, 84);
-                let h = lines.len().max(1) as f64 * BASE_LINE_HEIGHT + 6.0;
-                cursor_y = ensure_room(cursor_y, h + 4.0, &mut page, &mut doc);
-                let y_top = cursor_y;
-                let y_bottom = y_top - h;
-                let body_w = PAGE_WIDTH - 2.0 * MARGIN - 14.0;
-                page.graphics()
-                    .set_fill_color(Color::rgb(0.96, 0.97, 0.99))
-                    .rectangle(MARGIN + 6.0, y_bottom, body_w, h)
-                    .fill();
-                page.graphics()
-                    .set_fill_color(Color::rgb(0.45, 0.55, 0.78))
-                    .rectangle(MARGIN + 2.0, y_bottom, 4.5, h)
-                    .fill();
-                draw_rich_block(
+
+            MarkdownBlock::DisplayMath(expr) => {
+                cursor_y = draw_display_math_block(
                     &mut page,
-                    spans,
+                    expr,
                     &face,
-                    11.0,
-                    MARGIN + 10.0,
-                    &mut cursor_y,
-                    BASE_LINE_HEIGHT,
-                    84,
+                    cursor_y,
+                    &mut doc,
+                    &mut math_cache,
                 )?;
-                cursor_y -= 4.0;
+            }
+
+            MarkdownBlock::Blockquote(lines) => {
+                cursor_y = draw_blockquote(
+                    &mut page,
+                    lines,
+                    &face,
+                    cursor_y,
+                    &mut doc,
+                    &mut math_cache,
+                )?;
             }
         }
     }
@@ -828,12 +2240,24 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
 
 fn estimate_rich_block_height(spans: &[InlineSpan], max_cols: usize, font_size: f64) -> f64 {
     let lines = layout_spans_lines(spans, max_cols);
-    let lh = if font_size >= 18.0 {
+    lines
+        .iter()
+        .map(|line| estimate_rich_line_height(line, font_size))
+        .sum::<f64>()
+        .max(BASE_LINE_HEIGHT)
+}
+
+fn estimate_rich_line_height(line: &[InlineSpan], font_size: f64) -> f64 {
+    let base = if font_size >= 18.0 {
         (font_size * 1.2).max(BASE_LINE_HEIGHT)
     } else {
         BASE_LINE_HEIGHT
     };
-    lines.len().max(1) as f64 * lh
+    if line.iter().any(|span| span.style.math) {
+        base.max(BASE_LINE_HEIGHT + 4.0)
+    } else {
+        base
+    }
 }
 
 fn draw_rich_block(
@@ -843,12 +2267,22 @@ fn draw_rich_block(
     default_size: f64,
     x0: f64,
     cursor_y: &mut f64,
-    line_height: f64,
     max_cols: usize,
+    math_cache: &mut MathRenderCache,
 ) -> Result<(), String> {
     let lines = layout_spans_lines(spans, max_cols);
     for line in lines {
-        draw_rich_line_segments(page, &line, face, default_size, x0, cursor_y, line_height)?;
+        let line_height = estimate_rich_line_height(&line, default_size);
+        draw_rich_line_segments(
+            page,
+            &line,
+            face,
+            default_size,
+            x0,
+            cursor_y,
+            line_height,
+            math_cache,
+        )?;
     }
     Ok(())
 }
@@ -874,27 +2308,40 @@ fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSp
         lines.push(out);
     };
 
-    for (ch, st) in flat {
-        if ch == '\n' {
-            flush_line(&mut cur_line, &mut lines);
-            cur_width = 0;
-            continue;
-        }
-        let w = char_display_width(ch);
-        if cur_width + w > max_cols && cur_width > 0 {
-            flush_line(&mut cur_line, &mut lines);
-            cur_width = 0;
-        }
-        if let Some(last) = cur_line.last_mut() {
-            if last.1 == st {
-                last.0.push(ch);
-            } else {
-                cur_line.push((ch.to_string(), st));
+    for token in flat {
+        match token {
+            LayoutToken::Break => {
+                flush_line(&mut cur_line, &mut lines);
+                cur_width = 0;
+                continue;
             }
-        } else {
-            cur_line.push((ch.to_string(), st));
+            LayoutToken::Char(ch, st) => {
+                let w = char_display_width(ch);
+                if cur_width + w > max_cols && cur_width > 0 {
+                    flush_line(&mut cur_line, &mut lines);
+                    cur_width = 0;
+                }
+                if let Some(last) = cur_line.last_mut() {
+                    if last.1 == st {
+                        last.0.push(ch);
+                    } else {
+                        cur_line.push((ch.to_string(), st));
+                    }
+                } else {
+                    cur_line.push((ch.to_string(), st));
+                }
+                cur_width += w;
+            }
+            LayoutToken::Math(expr, st) => {
+                let w = math_display_width(&expr);
+                if cur_width + w > max_cols && cur_width > 0 {
+                    flush_line(&mut cur_line, &mut lines);
+                    cur_width = 0;
+                }
+                cur_line.push((expr, st));
+                cur_width += w;
+            }
         }
-        cur_width += w;
     }
     flush_line(&mut cur_line, &mut lines);
     if lines.is_empty() {
@@ -903,11 +2350,25 @@ fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSp
     lines
 }
 
-fn flatten_spans(spans: &[InlineSpan]) -> Vec<(char, TextStyle)> {
+enum LayoutToken {
+    Break,
+    Char(char, TextStyle),
+    Math(String, TextStyle),
+}
+
+fn flatten_spans(spans: &[InlineSpan]) -> Vec<LayoutToken> {
     let mut v = Vec::new();
     for s in spans {
+        if s.style.math {
+            v.push(LayoutToken::Math(s.text.clone(), s.style));
+            continue;
+        }
         for ch in s.text.chars() {
-            v.push((ch, s.style));
+            if ch == '\n' || ch == '\r' {
+                v.push(LayoutToken::Break);
+            } else {
+                v.push(LayoutToken::Char(ch, s.style));
+            }
         }
     }
     v
@@ -921,9 +2382,11 @@ fn draw_rich_line_segments(
     x0: f64,
     cursor_y: &mut f64,
     line_height: f64,
+    math_cache: &mut MathRenderCache,
 ) -> Result<(), String> {
     let y = *cursor_y;
     let mut x = x0;
+    let mut consumed_height = line_height;
     for seg in line {
         let size = if seg.style.code {
             (default_size - 1.0).max(8.5)
@@ -931,11 +2394,32 @@ fn draw_rich_line_segments(
             default_size
         };
         let font = face.pick(seg.style, &seg.text);
-        if seg.text.is_empty() {
+        if seg.style.math {
+            if let Some(rendered) = math_cache.render(&seg.text, false) {
+                let max_height = (size * 1.45).max(line_height * 0.95);
+                let (draw_width, draw_height) = scale_math_image(&rendered, max_height);
+                consumed_height = consumed_height.max(draw_height + MATH_INLINE_EXTRA_LINE_PT);
+                let baseline_offset = rendered.baseline_pt.max(draw_height * 0.45);
+                let draw_y = y - baseline_offset - MATH_INLINE_Y_OFFSET_PT;
+                draw_image_on_page(
+                    page,
+                    &rendered.jpeg_data,
+                    "jpeg",
+                    x,
+                    draw_y,
+                    draw_width,
+                    draw_height,
+                )?;
+                x += draw_width;
+                continue;
+            }
+        }
+        let rendered_text = seg.text.clone();
+        if rendered_text.is_empty() {
             continue;
         }
         if seg.style.code {
-            let w = approx_width_pt(&seg.text, &font, size).max(size * 0.6);
+            let w = approx_width_pt(&rendered_text, &font, size).max(size * 0.6);
             let pad_y = size * 0.25;
             let box_h = size * 1.2;
             let box_bottom = y - pad_y;
@@ -944,7 +2428,11 @@ fn draw_rich_line_segments(
                 .rectangle(x - 1.5, box_bottom - 1.0, w + 3.0, box_h + 2.0)
                 .fill();
         }
-        let fill = if seg.style.bold && !ascii_only(&seg.text) && !face.has_custom_bold {
+        let fill = if seg.style.link {
+            Color::rgb(0.13, 0.34, 0.82)
+        } else if seg.style.math {
+            Color::rgb(0.12, 0.12, 0.18)
+        } else if seg.style.bold && !ascii_only(&seg.text) && !face.has_custom_bold {
             Color::rgb(0.04, 0.04, 0.07)
         } else if seg.style.code {
             Color::rgb(0.08, 0.1, 0.14)
@@ -953,16 +2441,316 @@ fn draw_rich_line_segments(
         } else {
             Color::rgb(0.02, 0.02, 0.04)
         };
+        let draw_width = draw_text_segment(page, face, &rendered_text, seg, &font, size, x, y, fill)?;
+        if seg.style.link {
+            let underline_y = y - (size * 0.12).max(1.0);
+            page.graphics()
+                .set_stroke_color(fill)
+                .set_line_width(0.65)
+                .move_to(x, underline_y)
+                .line_to(x + draw_width, underline_y)
+                .stroke();
+        }
+        x += draw_width;
+    }
+    *cursor_y -= consumed_height;
+    Ok(())
+}
+
+fn draw_text_segment(
+    page: &mut OxidizePage,
+    face: &PreviewFace,
+    rendered_text: &str,
+    seg: &InlineSpan,
+    font: &Font,
+    size: f64,
+    x: f64,
+    y: f64,
+    fill: Color,
+) -> Result<f64, String> {
+    let needs_fake_bold = is_potential_bold_face(face, seg.style, &seg.text);
+    let needs_fake_italic = should_fake_italic(seg.style, &seg.text);
+    let width = measure_text_segment_width(face, rendered_text, seg.style, font, size);
+
+    if needs_fake_italic && !text_has_emoji(rendered_text) {
+        return draw_faux_italic_text(
+            page,
+            rendered_text,
+            font.clone(),
+            size,
+            x,
+            y,
+            fill,
+            needs_fake_bold,
+        )
+        .map(|_| width);
+    }
+
+    if needs_fake_bold && !text_has_emoji(rendered_text) {
+        draw_fake_bold_text(page, rendered_text, font.clone(), size, x, y, fill)?;
+        return Ok(width);
+    }
+
+    if text_has_emoji(rendered_text) && !seg.style.code {
+        draw_mixed_emoji_text(page, face, rendered_text, seg, size, x, y, fill)?;
+        return Ok(width);
+    }
+
+    page.text()
+        .set_fill_color(fill)
+        .set_font(font.clone(), size)
+        .at(x, y)
+        .write(rendered_text)
+        .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+    Ok(width)
+}
+
+fn draw_mixed_emoji_text(
+    page: &mut OxidizePage,
+    face: &PreviewFace,
+    text: &str,
+    seg: &InlineSpan,
+    size: f64,
+    x: f64,
+    y: f64,
+    fill: Color,
+) -> Result<(), String> {
+    let mut cursor_x = x;
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+        let draw_size = if seg.style.code {
+            (size - 1.0).max(8.5)
+        } else {
+            size
+        };
+        if grapheme_has_emoji(grapheme) {
+            if let Some((png_bytes, width_pt, height_pt)) = rasterize_emoji_grapheme(face, grapheme, draw_size)? {
+                let display_width = width_pt * EMOJI_DISPLAY_SCALE;
+                let display_height = height_pt * EMOJI_DISPLAY_SCALE;
+                let emoji_y = y - display_height * 0.80;
+                draw_image_on_page(
+                    page,
+                    &png_bytes,
+                    "png",
+                    cursor_x,
+                    emoji_y,
+                    display_width,
+                    display_height,
+                )?;
+                cursor_x += display_width;
+                continue;
+            }
+        }
+        let font = font_for_grapheme(face, seg.style, grapheme);
+        let w = approx_width_pt(grapheme, &font, draw_size);
         page.text()
             .set_fill_color(fill)
-            .set_font(font.clone(), size)
-            .at(x, y)
-            .write(&seg.text)
+            .set_font(font, draw_size)
+            .at(cursor_x, y)
+            .write(grapheme)
             .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
-        x += approx_width_pt(&seg.text, &font, size);
+        cursor_x += w;
     }
-    *cursor_y -= line_height;
     Ok(())
+}
+
+fn measure_text_segment_width(
+    face: &PreviewFace,
+    text: &str,
+    style: TextStyle,
+    font: &Font,
+    size: f64,
+) -> f64 {
+    if !text_has_emoji(text) || style.code || style.math {
+        return approx_width_pt(text, font, size);
+    }
+
+    UnicodeSegmentation::graphemes(text, true)
+        .map(|grapheme| {
+            if grapheme_has_emoji(grapheme) {
+                emoji_grapheme_width_pt(face, grapheme, size)
+            } else {
+                let grapheme_font = font_for_grapheme(face, style, grapheme);
+                approx_width_pt(grapheme, &grapheme_font, size)
+            }
+        })
+        .sum()
+}
+
+fn emoji_grapheme_width_pt(face: &PreviewFace, grapheme: &str, font_size: f64) -> f64 {
+    if let Some((_, width_pt, _)) = rasterize_emoji_grapheme(face, grapheme, font_size).ok().flatten() {
+        return (width_pt * EMOJI_DISPLAY_SCALE).max(font_size * 0.85);
+    }
+    font_size * EMOJI_DISPLAY_SCALE
+}
+
+fn font_for_grapheme(face: &PreviewFace, style: TextStyle, grapheme: &str) -> Font {
+    if style.code {
+        if ascii_only(grapheme) {
+            return Font::Courier;
+        }
+        return face.body.clone();
+    }
+    if style.math {
+        if ascii_only(grapheme) {
+            return Font::TimesItalic;
+        }
+        return face.body.clone();
+    }
+    if grapheme_has_emoji(grapheme) {
+        if let Some(font) = &face.emoji {
+            return font.clone();
+        }
+    }
+    face.pick(style, grapheme)
+}
+
+fn text_has_emoji(text: &str) -> bool {
+    UnicodeSegmentation::graphemes(text, true).any(grapheme_has_emoji)
+}
+
+fn grapheme_has_emoji(grapheme: &str) -> bool {
+    grapheme.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{1F1E6}'..='\u{1F1FF}'
+                | '\u{1F300}'..='\u{1FAFF}'
+                | '\u{2600}'..='\u{26FF}'
+                | '\u{2700}'..='\u{27BF}'
+                | '\u{FE0F}'
+                | '\u{200D}'
+        )
+    })
+}
+
+fn emoji_raster_font(path: &Path) -> Option<&'static RustFont<'static>> {
+    static FONT: OnceLock<Option<RustFont<'static>>> = OnceLock::new();
+    let loaded = FONT.get_or_init(|| {
+        let bytes = std::fs::read(path).ok()?;
+        RustFont::try_from_vec(bytes)
+    });
+    loaded.as_ref()
+}
+
+fn rasterize_emoji_grapheme(
+    face: &PreviewFace,
+    grapheme: &str,
+    font_size: f64,
+) -> Result<Option<(Vec<u8>, f64, f64)>, String> {
+    let Some(path) = &face.emoji_path else {
+        return Ok(None);
+    };
+    let Some(font) = emoji_raster_font(path) else {
+        return Ok(None);
+    };
+
+    let scale_px = (font_size as f32) * EMOJI_RASTER_PX_PER_PT;
+    let scale = Scale::uniform(scale_px);
+    let v_metrics = font.v_metrics(scale);
+    let glyph = font
+        .layout(grapheme, scale, point(0.0, v_metrics.ascent))
+        .next();
+    let Some(glyph) = glyph else {
+        return Ok(None);
+    };
+    let Some(bb) = glyph.pixel_bounding_box() else {
+        return Ok(None);
+    };
+
+    let width = bb.width().max(1) as u32;
+    let height = bb.height().max(1) as u32;
+    let mut image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
+    let dx = -bb.min.x;
+    let dy = -bb.min.y;
+    glyph.draw(|x, y, v| {
+        let px = (x as i32 + dx).max(0) as u32;
+        let py = (y as i32 + dy).max(0) as u32;
+        if px < width && py < height {
+            image.put_pixel(px, py, image::Rgba([0, 0, 0, (v * 255.0) as u8]));
+        }
+    });
+
+    let mut png = Vec::new();
+    DynamicImage::ImageRgba8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            ImageOutputFormat::Png,
+        )
+        .map_err(|e| format!("絵文字画像の書き出しに失敗しました: {e}"))?;
+
+    Ok(Some((
+        png,
+        width as f64 / EMOJI_RASTER_PX_PER_PT as f64,
+        height as f64 / EMOJI_RASTER_PX_PER_PT as f64,
+    )))
+}
+
+fn draw_faux_italic_text(
+    page: &mut OxidizePage,
+    text: &str,
+    font: Font,
+    size: f64,
+    x: f64,
+    y: f64,
+    fill: Color,
+    bold: bool,
+) -> Result<(), String> {
+    let mut cursor_x = x;
+    let mut seen_chars = 0usize;
+    for (idx, ch) in text.chars().enumerate() {
+        let ch_text = ch.to_string();
+        let skew = (idx as f64 * (size * 0.012)).min(size * 0.12);
+        let draw_x = cursor_x + skew;
+        if bold {
+            draw_fake_bold_text(page, &ch_text, font.clone(), size, draw_x, y, fill)?;
+        } else {
+            page.text()
+                .set_fill_color(fill)
+                .set_font(font.clone(), size)
+                .at(draw_x, y)
+                .write(&ch_text)
+                .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+        }
+        cursor_x += approx_width_pt(&ch_text, &font, size);
+        seen_chars += 1;
+    }
+    if seen_chars == 0 {
+        page.text()
+            .set_fill_color(fill)
+            .set_font(font, size)
+            .at(x, y)
+            .write(text)
+            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+    }
+    Ok(())
+}
+
+fn code_block_fits_on_single_page(block_h: f64) -> bool {
+    block_h + 8.0 <= PAGE_HEIGHT - 2.0 * MARGIN
+}
+
+fn draw_code_block_line(
+    page: &mut OxidizePage,
+    line: &str,
+    face: &PreviewFace,
+    size: f64,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    let font = face.pick(
+        TextStyle {
+            code: true,
+            math: false,
+            ..TextStyle::default()
+        },
+        line,
+    );
+    page.text()
+        .set_fill_color(Color::rgb(0.08, 0.1, 0.14))
+        .set_font(font, size)
+        .at(x, y)
+        .write(line)
+        .map(|_| ())
+        .map_err(|e| format!("テキスト描画に失敗しました: {e}"))
 }
 
 fn approx_width_pt(text: &str, font: &Font, font_size: f64) -> f64 {
@@ -974,11 +2762,12 @@ fn approx_width_pt(text: &str, font: &Font, font_size: f64) -> f64 {
         | Font::Courier
         | Font::CourierBold
         | Font::CourierOblique
-        | Font::CourierBoldOblique => oxidize_pdf::text::measure_text(text, font.clone(), font_size),
-        Font::TimesRoman
-        | Font::TimesBold
-        | Font::TimesItalic
-        | Font::TimesBoldItalic => oxidize_pdf::text::measure_text(text, font.clone(), font_size),
+        | Font::CourierBoldOblique => {
+            oxidize_pdf::text::measure_text(text, font.clone(), font_size)
+        }
+        Font::TimesRoman | Font::TimesBold | Font::TimesItalic | Font::TimesBoldItalic => {
+            oxidize_pdf::text::measure_text(text, font.clone(), font_size)
+        }
         Font::Custom(_) => {
             let cols: f64 = text.chars().map(|c| char_display_width(c) as f64).sum();
             cols * (font_size * 0.52)
@@ -990,10 +2779,21 @@ fn approx_width_pt(text: &str, font: &Font, font_size: f64) -> f64 {
     }
 }
 
-fn cell_plain_text(row: &[Vec<InlineSpan>], ci: usize) -> String {
-    row.get(ci)
-        .map(|c| c.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(""))
-        .unwrap_or_default()
+fn list_item_content_x(prefix: &str, font: &Font, font_size: f64) -> f64 {
+    MARGIN + 4.0 + approx_width_pt(prefix, font, font_size) + 4.0
+}
+
+fn should_fake_italic(style: TextStyle, text: &str) -> bool {
+    style.italic && !ascii_only(text)
+}
+
+fn wrap_table_row_cells(row: &[Vec<InlineSpan>], max_cell_cols: usize) -> Vec<Vec<String>> {
+    row.iter()
+        .map(|cell| {
+            let text = cell.iter().map(|s| s.text.as_str()).collect::<String>();
+            wrap_text(&text, max_cell_cols)
+        })
+        .collect()
 }
 
 /// 表全体を一度に罫線で囲み、行ごとの縦線の重ね描きを避ける（ずれ・破線の主因だった）。
@@ -1002,12 +2802,15 @@ fn draw_table(
     rows: &[Vec<Vec<InlineSpan>>],
     face: &PreviewFace,
     cursor_y: &mut f64,
-    row_h: f64,
+    _row_h: f64,
 ) -> Result<(), String> {
     if rows.is_empty() {
         return Ok(());
     }
     let fs = 9.5;
+    let line_height = 11.0;
+    let row_padding_top = 5.0;
+    let row_padding_bottom = 4.0;
     let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
     let nrows = rows.len();
     let table_left = MARGIN + 4.0;
@@ -1016,10 +2819,30 @@ fn draw_table(
     let max_cell_cols = ((col_w - 8.0) / (fs * 0.52)).max(3.0).floor() as usize;
 
     let table_top = *cursor_y;
-    let table_bottom = table_top - nrows as f64 * row_h;
+    let wrapped_rows: Vec<Vec<Vec<String>>> = rows
+        .iter()
+        .map(|row| wrap_table_row_cells(row, max_cell_cols))
+        .collect();
+    let row_heights: Vec<f64> = wrapped_rows
+        .iter()
+        .map(|cells| {
+            let max_lines = cells
+                .iter()
+                .map(|cell| cell.len().max(1))
+                .max()
+                .unwrap_or(1);
+            row_padding_top + row_padding_bottom + max_lines as f64 * line_height
+        })
+        .collect();
+    let table_height: f64 = row_heights.iter().sum();
+    let table_bottom = table_top - table_height;
 
     for ri in 0..=nrows {
-        let y = table_top - ri as f64 * row_h;
+        let y = if ri == 0 {
+            table_top
+        } else {
+            table_top - row_heights.iter().take(ri).sum::<f64>()
+        };
         page.graphics()
             .set_stroke_color(Color::gray(0.42))
             .set_line_width(0.45)
@@ -1037,25 +2860,396 @@ fn draw_table(
             .stroke();
     }
 
-    for (ri, row) in rows.iter().enumerate() {
-        let baseline = table_top - ri as f64 * row_h - row_h * 0.72;
+    let mut row_top = table_top;
+    for (ri, row) in wrapped_rows.iter().enumerate() {
+        let row_height = row_heights[ri];
+        let baseline = row_top - row_padding_top - fs * 0.85;
         for ci in 0..ncols {
-            let flat = cell_plain_text(row, ci);
-            let first_line = wrap_text(&flat, max_cell_cols)
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            page.text()
-                .set_fill_color(Color::rgb(0.02, 0.02, 0.04))
-                .set_font(face.body.clone(), fs)
-                .at(table_left + col_w * ci as f64 + 4.0, baseline)
-                .write(&first_line)
-                .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+            let cell_lines = row.get(ci).cloned().unwrap_or_else(|| vec![String::new()]);
+            let mut line_y = baseline;
+            for line in cell_lines {
+                page.text()
+                    .set_fill_color(Color::rgb(0.02, 0.02, 0.04))
+                    .set_font(face.body.clone(), fs)
+                    .at(table_left + col_w * ci as f64 + 4.0, line_y)
+                    .write(&line)
+                    .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+                line_y -= line_height;
+            }
         }
+        row_top -= row_height;
     }
 
     *cursor_y = table_bottom - 6.0;
     Ok(())
+}
+
+fn draw_blockquote(
+    page: &mut OxidizePage,
+    lines: &[BlockquoteLine],
+    face: &PreviewFace,
+    cursor_y: f64,
+    doc: &mut Document,
+    math_cache: &mut MathRenderCache,
+) -> Result<f64, String> {
+    let top_pad = 12.0;
+    let bottom_pad = 10.0;
+    let body_w = blockquote_body_width(lines, face, 11.0);
+    let text_x = MARGIN + 10.0;
+    let mut index = 0usize;
+    let mut page_cursor = cursor_y;
+
+    while index < lines.len() {
+        let mut segment_end = index;
+        let mut segment_height = top_pad + bottom_pad;
+        let mut segment_line_heights = Vec::new();
+
+        while segment_end < lines.len() {
+            let line_height = blockquote_line_height(&lines[segment_end], math_cache);
+            let tentative_height = segment_height + line_height;
+            if segment_end > index && page_cursor - (tentative_height + 6.0) <= MARGIN {
+                break;
+            }
+            segment_line_heights.push(line_height);
+            segment_height = tentative_height;
+            segment_end += 1;
+        }
+
+        if segment_end == index {
+            let line_height = blockquote_line_height(&lines[segment_end], math_cache);
+            segment_line_heights.push(line_height);
+            segment_height = top_pad + bottom_pad + line_height;
+            segment_end += 1;
+        }
+
+        page_cursor = ensure_room(page_cursor, segment_height + 6.0, page, doc);
+        let y_top = page_cursor;
+        let y_bottom = y_top - segment_height;
+
+        page.graphics()
+            .set_fill_color(Color::rgb(0.96, 0.97, 0.99))
+            .rectangle(MARGIN + 6.0, y_bottom, body_w, segment_height)
+            .fill();
+        page.graphics()
+            .set_fill_color(Color::rgb(0.45, 0.55, 0.78))
+            .rectangle(MARGIN + 2.0, y_bottom, 4.5, segment_height)
+            .fill();
+
+        let mut quoted_cursor = y_top - top_pad;
+        for (line, line_height) in lines[index..segment_end]
+            .iter()
+            .zip(segment_line_heights.iter())
+        {
+            match line {
+                BlockquoteLine::Text(spans) => {
+                    draw_rich_line_segments(
+                        page,
+                        spans,
+                        face,
+                        11.0,
+                        text_x,
+                        &mut quoted_cursor,
+                        *line_height,
+                        math_cache,
+                    )?;
+                }
+                BlockquoteLine::DisplayMath(expr) => {
+                    draw_blockquote_display_math_line(
+                        page,
+                        expr,
+                        body_w,
+                        text_x,
+                        &mut quoted_cursor,
+                        *line_height,
+                        face,
+                        math_cache,
+                    )?;
+                }
+                BlockquoteLine::CodeBlock { code } => {
+                    draw_blockquote_code_block(
+                        page,
+                        code,
+                        body_w,
+                        text_x,
+                        &mut quoted_cursor,
+                        *line_height,
+                        face,
+                    )?;
+                }
+            }
+        }
+        page_cursor = y_bottom - 10.0;
+        index = segment_end;
+    }
+
+    Ok(page_cursor)
+}
+
+fn blockquote_line_height(line: &BlockquoteLine, math_cache: &mut MathRenderCache) -> f64 {
+    match line {
+        BlockquoteLine::Text(spans) => {
+            layout_spans_lines(spans, blockquote_wrap_cols())
+                .iter()
+                .map(|line| blockquote_wrapped_text_line_height(line, math_cache))
+                .sum()
+        }
+        BlockquoteLine::DisplayMath(expr) => {
+            if let Some(rendered) = math_cache.render(expr, true) {
+                rendered.height_pt + 8.0
+            } else {
+                26.0
+            }
+        }
+        BlockquoteLine::CodeBlock { code } => {
+            let code_lines = wrap_code_lines(code, 68);
+            let line_height = (BASE_LINE_HEIGHT - 1.0).max(13.0);
+            code_lines.len().max(1) as f64 * line_height + 18.0
+        }
+    }
+}
+
+fn blockquote_wrap_cols() -> usize {
+    96
+}
+
+fn blockquote_wrapped_text_line_height(
+    line: &[InlineSpan],
+    math_cache: &mut MathRenderCache,
+) -> f64 {
+    let mut height = BASE_LINE_HEIGHT;
+    for seg in line {
+        if !seg.style.math {
+            continue;
+        }
+        if let Some(rendered) = math_cache.render(&seg.text, false) {
+            height = height.max(rendered.height_pt + MATH_INLINE_EXTRA_LINE_PT);
+        } else {
+            height = height.max(BASE_LINE_HEIGHT + 4.0);
+        }
+    }
+    height
+}
+
+fn draw_blockquote_display_math_line(
+    page: &mut OxidizePage,
+    expr: &str,
+    body_w: f64,
+    text_x: f64,
+    cursor_y: &mut f64,
+    line_height: f64,
+    _face: &PreviewFace,
+    math_cache: &mut MathRenderCache,
+) -> Result<(), String> {
+    let Some(rendered) = math_cache.render(expr, true) else {
+        *cursor_y -= line_height;
+        return Ok(());
+    };
+
+    let max_height = rendered.height_pt.max(line_height - 2.0);
+    let (draw_width, draw_height) = scale_math_image(&rendered, max_height);
+    let draw_x = text_x + ((body_w - 20.0) - draw_width).max(0.0) / 2.0;
+    let draw_y = *cursor_y - draw_height * 0.72;
+    draw_image_on_page(
+        page,
+        &rendered.jpeg_data,
+        "jpeg",
+        draw_x,
+        draw_y,
+        draw_width,
+        draw_height,
+    )?;
+    *cursor_y -= line_height;
+    Ok(())
+}
+
+fn draw_blockquote_code_block(
+    page: &mut OxidizePage,
+    code: &str,
+    body_w: f64,
+    text_x: f64,
+    cursor_y: &mut f64,
+    line_height: f64,
+    face: &PreviewFace,
+) -> Result<(), String> {
+    let code_lines = wrap_code_lines(code, 68);
+    let pad_x = 8.0;
+    let pad_y = 7.0;
+    let lh = (BASE_LINE_HEIGHT - 1.0).max(13.0);
+    let block_w = (body_w - 20.0).max(90.0);
+    let block_h = code_lines.len().max(1) as f64 * lh + pad_y * 2.0;
+    let block_bottom = *cursor_y - block_h + 2.0;
+    page.graphics()
+        .set_fill_color(Color::rgb(0.94, 0.95, 0.98))
+        .rectangle(text_x, block_bottom, block_w, block_h)
+        .fill();
+    page.graphics()
+        .set_stroke_color(Color::rgb(0.84, 0.87, 0.94))
+        .set_line_width(0.6)
+        .rectangle(text_x, block_bottom, block_w, block_h)
+        .stroke();
+
+    let mut baseline = *cursor_y - pad_y - 9.5 * 0.85;
+    for line in code_lines {
+        draw_code_block_line(page, &line, face, 9.5, text_x + pad_x, baseline)?;
+        baseline -= lh;
+    }
+    *cursor_y -= line_height;
+    Ok(())
+}
+
+fn draw_thematic_break(
+    page: &mut OxidizePage,
+    cursor_y: f64,
+    style: ThematicBreakStyle,
+    doc: &mut Document,
+) -> f64 {
+    let h = 18.0_f64;
+    let cursor_y = ensure_room(cursor_y, h, page, doc);
+    let y = cursor_y - h * 0.5;
+    let x0 = MARGIN + 10.0;
+    let x1 = PAGE_WIDTH - MARGIN - 10.0;
+
+    match style {
+        ThematicBreakStyle::Hyphen => {
+            page.graphics()
+                .set_stroke_color(Color::gray(0.72))
+                .set_line_width(1.15)
+                .move_to(x0, y)
+                .line_to(x1, y)
+                .stroke();
+        }
+        ThematicBreakStyle::Asterisk => {
+            draw_dashed_horizontal_line(page, x0, x1, y, 10.0, 6.0, 1.15, Color::gray(0.64));
+        }
+        ThematicBreakStyle::Underscore => {
+            let gap = 2.2;
+            page.graphics()
+                .set_stroke_color(Color::gray(0.68))
+                .set_line_width(0.95)
+                .move_to(x0, y - gap)
+                .line_to(x1, y - gap)
+                .stroke();
+            page.graphics()
+                .set_stroke_color(Color::gray(0.68))
+                .set_line_width(0.95)
+                .move_to(x0, y + gap)
+                .line_to(x1, y + gap)
+                .stroke();
+        }
+    }
+
+    cursor_y - h
+}
+
+fn draw_dashed_horizontal_line(
+    page: &mut OxidizePage,
+    x0: f64,
+    x1: f64,
+    y: f64,
+    dash_len: f64,
+    gap_len: f64,
+    line_width: f64,
+    color: Color,
+) {
+    let mut x = x0;
+    while x < x1 {
+        let end = (x + dash_len).min(x1);
+        page.graphics()
+            .set_stroke_color(color)
+            .set_line_width(line_width)
+            .move_to(x, y)
+            .line_to(end, y)
+            .stroke();
+        x = end + gap_len;
+    }
+}
+
+fn draw_display_math_block(
+    page: &mut OxidizePage,
+    expr: &str,
+    face: &PreviewFace,
+    cursor_y: f64,
+    doc: &mut Document,
+    math_cache: &mut MathRenderCache,
+) -> Result<f64, String> {
+    let font_size = 12.5;
+    let top_pad = 12.0;
+    let bottom_pad = 12.0;
+    if let Some(rendered) = math_cache.render(expr, true) {
+        let content_max_height = (PAGE_HEIGHT / 3.2).max(rendered.height_pt);
+        let (draw_width, draw_height) = scale_math_image(&rendered, content_max_height);
+        let block_h = draw_height + top_pad + bottom_pad;
+        let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc);
+        let y_top = page_cursor;
+        let y_bottom = y_top - block_h;
+        let draw_x = MARGIN + ((PAGE_WIDTH - 2.0 * MARGIN) - draw_width) / 2.0;
+        let draw_y = y_bottom + bottom_pad + 1.0;
+        draw_image_on_page(
+            page,
+            &rendered.jpeg_data,
+            "jpeg",
+            draw_x,
+            draw_y,
+            draw_width,
+            draw_height,
+        )?;
+
+        page_cursor = y_bottom - 8.0;
+        return Ok(page_cursor);
+    }
+    let lines = format_math_expression(expr);
+    let line_height = 18.0;
+    let block_h = lines.len().max(1) as f64 * line_height + top_pad + bottom_pad;
+    let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc);
+    let y_top = page_cursor;
+    let y_bottom = y_top - block_h;
+
+    let mut baseline = y_top - top_pad - font_size * 0.55;
+    for line in lines {
+        let font = face.pick(
+            TextStyle {
+                math: true,
+                ..TextStyle::default()
+            },
+            &line,
+        );
+        let text_w = approx_width_pt(&line, &font, font_size);
+        let x = MARGIN + ((PAGE_WIDTH - 2.0 * MARGIN) - text_w) / 2.0;
+        page.text()
+            .set_fill_color(Color::rgb(0.12, 0.12, 0.18))
+            .set_font(font, font_size)
+            .at(x, baseline)
+            .write(&line)
+            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
+        baseline -= line_height;
+    }
+
+    page_cursor = y_bottom - 8.0;
+    Ok(page_cursor)
+}
+
+fn classify_thematic_break_style(line: &str) -> ThematicBreakStyle {
+    let trimmed = line.trim();
+    let mut chars = trimmed.chars().filter(|ch| !ch.is_whitespace());
+    let Some(first) = chars.next() else {
+        return ThematicBreakStyle::Hyphen;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return ThematicBreakStyle::Hyphen;
+    }
+    if chars.any(|ch| ch != first) {
+        return ThematicBreakStyle::Hyphen;
+    }
+    match first {
+        '-' => ThematicBreakStyle::Hyphen,
+        '*' => ThematicBreakStyle::Asterisk,
+        '_' => ThematicBreakStyle::Underscore,
+        _ => ThematicBreakStyle::Hyphen,
+    }
+}
+
+fn blockquote_body_width(_lines: &[BlockquoteLine], _face: &PreviewFace, _font_size: f64) -> f64 {
+    (PAGE_WIDTH - 2.0 * MARGIN - 12.0).max(110.0)
 }
 
 fn ensure_room(
@@ -1065,6 +3259,19 @@ fn ensure_room(
     doc: &mut Document,
 ) -> f64 {
     if cursor_y - required_height > MARGIN {
+        return cursor_y;
+    }
+    // why: ページ先頭で巨大ブロックが来た場合、空ページを挿入してから描画すると
+    //      先頭に空白ページが混ざってしまう
+    // alt: そのままページ分割する（空ページが発生しやすい）
+    // evidence: 先頭の oversized block は同一ページへ描画した方が空白ページを避けられる
+    let page_top = PAGE_HEIGHT - MARGIN;
+    if (cursor_y - page_top).abs() < 0.5 && required_height > (PAGE_HEIGHT - 2.0 * MARGIN) {
+        log::warn!(
+            "Skipping automatic page break for oversized block on an empty page: required_height={}, available_height={}",
+            required_height,
+            PAGE_HEIGHT - 2.0 * MARGIN
+        );
         return cursor_y;
     }
     let mut next_page = OxidizePage::new(PAGE_WIDTH, PAGE_HEIGHT);
@@ -1122,7 +3329,7 @@ fn unicode_display_width(s: &str) -> usize {
 
 fn wrap_code_lines(code: &str, max_chars: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for raw in code.lines() {
+    for raw in code.trim_end_matches('\n').split('\n') {
         let mut buf = String::new();
         let mut count = 0usize;
         for ch in raw.chars() {
@@ -1133,9 +3340,7 @@ fn wrap_code_lines(code: &str, max_chars: usize) -> Vec<String> {
             buf.push(ch);
             count += 1;
         }
-        if !buf.is_empty() {
-            out.push(buf);
-        }
+        out.push(buf);
     }
     if out.is_empty() {
         out.push(String::new());
@@ -1143,10 +3348,8 @@ fn wrap_code_lines(code: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
-/// `npm install` 済みの開発用リポジトリでは `node_modules/.bin/mmdc` をそのまま使う。
-fn resolve_mmdc_workspace_node_modules_bin() -> Option<PathBuf> {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
-    let bin = workspace_root.join("node_modules").join(".bin");
+fn resolve_mmdc_node_modules_bin_from(root: &Path) -> Option<PathBuf> {
+    let bin = root.join("node_modules").join(".bin");
 
     #[cfg(windows)]
     {
@@ -1167,6 +3370,22 @@ fn resolve_mmdc_workspace_node_modules_bin() -> Option<PathBuf> {
     None
 }
 
+/// `npm install` 済みの開発用リポジトリでは `node_modules/.bin/mmdc` をそのまま使う。
+fn resolve_mmdc_workspace_node_modules_bin() -> Option<PathBuf> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
+    resolve_mmdc_node_modules_bin_from(workspace_root)
+}
+
+fn resolve_mmdc_cwd_node_modules_bin() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    for dir in cwd.ancestors() {
+        if let Some(found) = resolve_mmdc_node_modules_bin_from(dir) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn resolve_mmdc_executable() -> PathBuf {
     if let Some(p) = std::env::var_os("MINIPDF_MERMAID_CLI") {
         if !p.is_empty() {
@@ -1175,6 +3394,10 @@ fn resolve_mmdc_executable() -> PathBuf {
     }
 
     if let Some(p) = resolve_mmdc_workspace_node_modules_bin() {
+        return p;
+    }
+
+    if let Some(p) = resolve_mmdc_cwd_node_modules_bin() {
         return p;
     }
 
@@ -1204,6 +3427,11 @@ fn resolve_mmdc_executable() -> PathBuf {
     PathBuf::from("mmdc")
 }
 
+fn mermaid_cli_is_available() -> bool {
+    let path = resolve_mmdc_executable();
+    Command::new(path).arg("--version").output().is_ok()
+}
+
 fn max_chars_for_font(font_size: f64) -> usize {
     if font_size >= 22.0 {
         45
@@ -1218,6 +3446,11 @@ fn render_mermaid_png(code: &str) -> Result<Option<(Vec<u8>, f64, f64)>, String>
     let work_dir = std::env::temp_dir().join(format!("miniPDF-mermaid-{}", Uuid::new_v4()));
     fs::create_dir_all(&work_dir)
         .map_err(|e| format!("Mermaid作業ディレクトリの作成に失敗しました: {e}"))?;
+
+    if !mermaid_cli_is_available() {
+        cleanup_dir(&work_dir);
+        return Ok(None);
+    }
 
     let input_path = work_dir.join("diagram.mmd");
     let output_path = work_dir.join("diagram.png");
@@ -1255,8 +3488,8 @@ fn render_mermaid_png(code: &str) -> Result<Option<(Vec<u8>, f64, f64)>, String>
         return Ok(None);
     }
 
-    let png_data = fs::read(&output_path)
-        .map_err(|e| format!("Mermaid画像の読み込みに失敗しました: {e}"))?;
+    let png_data =
+        fs::read(&output_path).map_err(|e| format!("Mermaid画像の読み込みに失敗しました: {e}"))?;
     let image = image::load_from_memory(&png_data)
         .map_err(|e| format!("Mermaid画像サイズの取得に失敗しました: {e}"))?;
     let (width, height) = image.dimensions();
@@ -1295,14 +3528,14 @@ fn draw_image_on_page(
 
     let image_name = format!("mermaid-{}", Uuid::new_v4());
     page.add_image(&image_name, image_obj);
-    page.graphics()
-        .draw_image(&image_name, x, y, width, height);
+    page.graphics().draw_image(&image_name, x, y, width, height);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_ordered_list_separate_blocks() {
@@ -1342,6 +3575,16 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_wrapping_preserves_all_lines() {
+        let row = vec![vec![InlineSpan {
+            text: "abcdef".to_string(),
+            style: TextStyle::default(),
+        }]];
+        let wrapped = wrap_table_row_cells(&row, 3);
+        assert_eq!(wrapped, vec![vec!["abc".to_string(), "def".to_string()]]);
+    }
+
+    #[test]
     fn wrap_text_counts_cjk_width() {
         let s = "あいう";
         let lines = wrap_text(s, 4);
@@ -1357,7 +3600,9 @@ mod tests {
         match &b[0] {
             MarkdownBlock::Paragraph(spans) => {
                 assert!(
-                    spans.iter().any(|s| s.style.bold && s.text.contains("world")),
+                    spans
+                        .iter()
+                        .any(|s| s.style.bold && s.text.contains("world")),
                     "{spans:?}"
                 );
                 assert!(
@@ -1383,6 +3628,332 @@ mod tests {
             }
             _ => panic!("expected paragraph: {b:?}"),
         }
+    }
+
+    #[test]
+    fn paragraph_hard_break_is_preserved_for_windows_newlines() {
+        let md = "line one  \r\nline two\r\n";
+        let b = parse_markdown_blocks(md);
+        match &b[0] {
+            MarkdownBlock::Paragraph(spans) => {
+                let t = plain_text(spans);
+                assert!(
+                    t.contains('\n'),
+                    "expected Windows newline hard break to stay as line break, got {t:?}"
+                );
+                assert!(
+                    t.contains("line one"),
+                    "expected first line to survive, got {t:?}"
+                );
+                assert!(
+                    t.contains("line two"),
+                    "expected second line to survive, got {t:?}"
+                );
+            }
+            _ => panic!("expected paragraph: {b:?}"),
+        }
+    }
+
+    #[test]
+    fn paragraph_soft_breaks_survive_ascii_and_cjk_input() {
+        let md = "ASCII input\nnext line\n\n半角入力\n次の行\n";
+        let b = parse_markdown_blocks(md);
+        assert_eq!(b.len(), 3, "{b:?}");
+
+        match (&b[0], &b[1], &b[2]) {
+            (
+                MarkdownBlock::Paragraph(first),
+                MarkdownBlock::Spacer { lines: 1 },
+                MarkdownBlock::Paragraph(second),
+            ) => {
+                let first_text = plain_text(first);
+                let second_text = plain_text(second);
+                assert!(
+                    first_text.contains('\n'),
+                    "expected ASCII paragraph to preserve line break, got {first_text:?}"
+                );
+                assert!(
+                    second_text.contains('\n'),
+                    "expected CJK paragraph to preserve line break, got {second_text:?}"
+                );
+            }
+            _ => panic!("expected paragraph, spacer, paragraph blocks: {b:?}"),
+        }
+    }
+
+    #[test]
+    fn display_math_expression_is_simplified() {
+        let lines = format_math_expression(
+            "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains('∑'), "{joined}");
+        assert!(joined.contains('∫'), "{joined}");
+        assert!(joined.contains('∞'), "{joined}");
+        assert!(joined.contains('√'), "{joined}");
+        assert!(!joined.contains("\\frac"), "{joined}");
+        assert!(!joined.contains("\\sum"), "{joined}");
+    }
+
+    #[test]
+    fn vector_norm_notation_is_preserved_in_fallback_math() {
+        let lines = format_math_expression(
+            "\\|\\mathbf{x}\\|_2 = \\sqrt{x_1^2 + x_2^2 + x_3^2}",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains('‖'), "{joined}");
+        assert!(joined.contains('₂'), "{joined}");
+        assert!(joined.contains('√'), "{joined}");
+        assert!(!joined.contains("\\|"), "{joined}");
+        assert!(!joined.contains("\\mathbf"), "{joined}");
+    }
+
+    #[test]
+    fn norm_delimiters_are_normalized_for_katex_rendering() {
+        let normalized =
+            normalize_math_for_katex("\\left\\|\\mathbf{x}\\right\\|_2 + \\lVert y \\rVert");
+        assert!(normalized.contains('‖'), "{normalized}");
+        assert!(!normalized.contains("\\left"), "{normalized}");
+        assert!(!normalized.contains("\\right"), "{normalized}");
+        assert!(!normalized.contains("\\|"), "{normalized}");
+        assert!(!normalized.contains("\\lVert"), "{normalized}");
+        assert!(!normalized.contains("\\rVert"), "{normalized}");
+    }
+
+    #[test]
+    fn matrix_math_environment_is_compacted() {
+        let lines = format_math_expression(
+            "A =\n\\begin{bmatrix}\n1 & 2 & 3 \\\\\n4 & 5 & 6 \\\\\n7 & 8 & 9\n\\end{bmatrix}",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("A ="), "{joined}");
+        assert!(joined.contains('['), "{joined}");
+        assert!(joined.contains(']'), "{joined}");
+        assert!(!joined.contains("\\begin"), "{joined}");
+        assert!(!joined.contains("\\end"), "{joined}");
+    }
+
+    #[test]
+    fn katex_renderer_renders_inline_math_to_png() {
+        let rendered = render_math_with_katex("E = mc^2", false)
+            .expect("katex renderer should execute")
+            .expect("katex renderer should return an image");
+        assert!(!rendered.jpeg_data.is_empty(), "expected JPEG data");
+        assert!(rendered.width_pt > 0.0, "expected positive width");
+        assert!(rendered.height_pt > 0.0, "expected positive height");
+        assert!(rendered.baseline_pt > 0.0, "expected positive baseline");
+        assert!(
+            rendered.baseline_pt < rendered.height_pt,
+            "expected baseline within image height"
+        );
+    }
+
+    #[test]
+    fn katex_renderer_renders_display_math_to_png() {
+        let rendered = render_math_with_katex("\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}", true)
+            .expect("katex renderer should execute")
+            .expect("katex renderer should return an image");
+        assert!(!rendered.jpeg_data.is_empty(), "expected JPEG data");
+        assert!(rendered.width_pt > 0.0, "expected positive width");
+        assert!(rendered.height_pt > 0.0, "expected positive height");
+    }
+
+    #[test]
+    fn scale_math_image_never_expands_rendered_math() {
+        let rendered = MathRenderImage {
+            jpeg_data: vec![1, 2, 3],
+            width_pt: 120.0,
+            height_pt: 48.0,
+            baseline_pt: 34.0,
+        };
+        let (w, h) = scale_math_image(&rendered, 24.0);
+        assert!(w < rendered.width_pt, "{w}");
+        assert!(h < rendered.height_pt, "{h}");
+
+        let (w2, h2) = scale_math_image(&rendered, 96.0);
+        assert_eq!(w2, rendered.width_pt, "{w2}");
+        assert_eq!(h2, rendered.height_pt, "{h2}");
+    }
+
+    #[test]
+    fn transparent_border_is_trimmed_from_math_renders() {
+        let mut image = image::RgbaImage::from_pixel(6, 6, image::Rgba([0, 0, 0, 0]));
+        image.put_pixel(2, 1, image::Rgba([20, 30, 40, 255]));
+        image.put_pixel(3, 1, image::Rgba([20, 30, 40, 255]));
+        image.put_pixel(2, 2, image::Rgba([20, 30, 40, 255]));
+        image.put_pixel(3, 2, image::Rgba([20, 30, 40, 255]));
+
+        let (trimmed, width, height) = trim_transparent_border(&image);
+        assert_eq!(width, 2);
+        assert_eq!(height, 2);
+        assert_eq!(trimmed.width(), 2);
+        assert_eq!(trimmed.height(), 2);
+        assert_eq!(trimmed.get_pixel(0, 0).0[3], 255);
+    }
+
+    #[tokio::test]
+    async fn preview_consistency_fixture_renders_repeatedly_without_drift() {
+        let md = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/preview-consistency-test.md"
+        ));
+        let blocks = parse_markdown_blocks(md);
+        assert!(
+            !blocks.is_empty(),
+            "expected fixture to produce markdown blocks"
+        );
+
+        let mut first_page_count = None;
+        for _ in 0..3 {
+            let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+            let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+            let pdf_path = temp_dir.path().join("preview-consistency.pdf");
+            std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+            let loaded =
+                crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+                    .await
+                    .expect("generated preview PDF should be readable");
+
+            assert!(!loaded.pages.is_empty(), "expected at least one page");
+            if let Some(previous) = first_page_count {
+                assert_eq!(
+                    previous,
+                    loaded.pages.len(),
+                    "expected stable page count across runs"
+                );
+            } else {
+                first_page_count = Some(loaded.pages.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_renderer_visual_check_fixture_is_stable_and_safe() {
+        let md = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/markdown-renderer-visual-check.md"
+        ));
+        let blocks = parse_markdown_blocks(md);
+        assert!(
+            !blocks.is_empty(),
+            "expected visual check fixture to produce blocks"
+        );
+
+        let mut page_counts = Vec::new();
+        for _ in 0..2 {
+            let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+            let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+            let pdf_path = temp_dir.path().join("markdown-renderer-visual-check.pdf");
+            std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+            let loaded =
+                crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+                    .await
+                    .expect("generated preview PDF should be readable");
+
+            page_counts.push(loaded.pages.len());
+            let all_text = loaded
+                .pages
+                .iter()
+                .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                all_text.contains("Markdown Renderer Visual Check"),
+                "{all_text}"
+            );
+        assert!(all_text.contains("H1 見出し"), "{all_text}");
+        assert!(all_text.contains("item 1"), "{all_text}");
+        assert!(
+            all_text.contains("引用内コードブロック"),
+            "{all_text}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                MarkdownBlock::Heading { level: 2, spans }
+                    if plain_text(spans).contains("Unicode / 日本語 / 絵文字")
+            )),
+            "expected the post-Mermaid heading to remain parseable: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                MarkdownBlock::Heading { level: 2, spans }
+                    if plain_text(spans).contains("終端確認")
+            )),
+            "expected the visual fixture tail to remain parseable: {blocks:?}"
+        );
+        assert!(all_text.contains("XSS script tag"), "{all_text}");
+        assert!(
+            loaded.pages.iter().any(|page| !page.images.is_empty()),
+            "expected the visual fixture to contain rendered images for math or mermaid"
+        );
+        }
+
+        assert_eq!(page_counts[0], page_counts[1], "expected stable page count");
+    }
+
+    #[tokio::test]
+    async fn extra_blank_lines_are_clamped_in_preview_layout() {
+        let mut compact_lines = vec!["# Title".to_string()];
+        for i in 1..=15 {
+            compact_lines.push(format!(
+                "Paragraph {i}. This sentence is intentionally a little longer so the compact version stays close to a page boundary without wrapping into the next page too early."
+            ));
+            compact_lines.push(String::new());
+        }
+        let compact = compact_lines.join("\n");
+
+        let mut spaced_lines = vec![
+            "# Title".to_string(),
+        ];
+        for i in 1..=15 {
+            spaced_lines.push(format!(
+                "Paragraph {i}. This sentence is intentionally a little longer so the compact version stays close to a page boundary without wrapping into the next page too early."
+            ));
+            if i == 8 {
+                spaced_lines.extend(std::iter::repeat(String::new()).take(128));
+            }
+            spaced_lines.push(String::new());
+        }
+        let spaced = spaced_lines.join("\n");
+
+        let compact_blocks = parse_markdown_blocks(&compact);
+        let spaced_blocks = parse_markdown_blocks(&spaced);
+
+        let compact_bytes = build_preview_pdf(&compact_blocks).expect("compact preview should build");
+        let spaced_bytes = build_preview_pdf(&spaced_blocks).expect("spaced preview should build");
+
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let compact_path = temp_dir.path().join("compact.pdf");
+        let spaced_path = temp_dir.path().join("spaced.pdf");
+        std::fs::write(&compact_path, compact_bytes).expect("compact PDF should be written");
+        std::fs::write(&spaced_path, spaced_bytes).expect("spaced PDF should be written");
+
+        let compact_loaded =
+            crate::commands::pdf_loader::load_pdf(compact_path.to_string_lossy().to_string())
+                .await
+                .expect("compact PDF should be readable");
+        let spaced_loaded =
+            crate::commands::pdf_loader::load_pdf(spaced_path.to_string_lossy().to_string())
+                .await
+                .expect("spaced PDF should be readable");
+
+        assert_eq!(
+            compact_loaded.pages.len(),
+            spaced_loaded.pages.len(),
+            "compact_pages={}, spaced_pages={}",
+            compact_loaded.pages.len(),
+            spaced_loaded.pages.len()
+        );
+        let spaced_text = spaced_loaded
+            .pages
+            .iter()
+            .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(spaced_text.contains("Paragraph 15."), "{spaced_text}");
     }
 
     #[test]
@@ -1418,12 +3989,763 @@ mod tests {
         let md = "before\n\n---\n\nafter\n";
         let b = parse_markdown_blocks(md);
         assert!(
-            b.iter().any(|x| matches!(x, MarkdownBlock::ThematicBreak)),
+            b.iter().any(|x| matches!(x, MarkdownBlock::ThematicBreak(_))),
             "{b:?}"
+        );
+    }
+
+    #[test]
+    fn blank_lines_between_top_level_blocks_emit_spacers() {
+        let md = "first paragraph\n\n\nsecond paragraph\n";
+        let blocks = parse_markdown_blocks(md);
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, MarkdownBlock::Spacer { lines } if *lines >= 1)),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn spacer_block_clamps_excess_blank_lines() {
+        let md = "first paragraph\n\n\n\n\n\nsecond paragraph\n";
+        let blocks = parse_markdown_blocks(md);
+        let spacer_lines = blocks.iter().find_map(|block| match block {
+            MarkdownBlock::Spacer { lines } => Some(*lines),
+            _ => None,
+        });
+
+        assert_eq!(spacer_lines, Some(2), "{blocks:?}");
+    }
+
+    #[test]
+    fn unclosed_mermaid_fence_stops_before_following_heading() {
+        let md = "```mermaid\nflowchart TD\n    A -->\n\n## after\n";
+        let blocks = parse_markdown_blocks(md);
+
+        assert!(
+            matches!(&blocks[0], MarkdownBlock::CodeBlock { lang, .. } if lang == "mermaid"),
+            "{blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                MarkdownBlock::Heading { level: 2, spans }
+                    if plain_text(spans).contains("after")
+            )),
+            "{blocks:?}"
         );
     }
 
     fn plain_text(spans: &[InlineSpan]) -> String {
         spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn blockquote_plain_text(lines: &[BlockquoteLine]) -> String {
+        let mut out = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            match line {
+                BlockquoteLine::Text(spans) => out.push_str(&plain_text(spans)),
+                BlockquoteLine::DisplayMath(expr) => out.push_str(expr),
+                BlockquoteLine::CodeBlock { code } => out.push_str(code),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn links_are_marked_and_italic_japanese_requests_fake_slant() {
+        let md = "これは [OpenAI](https://openai.com) と *日本語* の確認です。\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Paragraph(spans) => {
+                assert!(spans.iter().any(|s| s.style.link), "{spans:?}");
+                assert!(
+                    spans.iter().any(|s| should_fake_italic(s.style, &s.text)),
+                    "{spans:?}"
+                );
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_math_spans_are_detected() {
+        let md = "インライン数式 $E = mc^2$ を確認します。\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Paragraph(spans) => {
+                assert!(spans.iter().any(|s| s.style.math), "{spans:?}");
+                let text = plain_text(spans);
+                assert!(text.contains("E = mc^2"), "{text}");
+                assert!(!text.contains('$'), "{text}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emoji_detection_matches_common_symbols() {
+        assert!(text_has_emoji("😀"), "expected grinning face to be detected");
+        assert!(text_has_emoji("日本語 🚀"), "expected mixed text with emoji to be detected");
+        assert!(grapheme_has_emoji("⚠️"), "expected warning sign with variation selector");
+        assert!(grapheme_has_emoji("🧪"), "expected test tube emoji to be detected");
+        assert!(!text_has_emoji("日本語"), "expected plain Japanese text to stay non-emoji");
+    }
+
+    #[test]
+    fn math_lines_request_more_vertical_room_than_plain_text_lines() {
+        let plain = vec![InlineSpan {
+            text: "plain text".to_string(),
+            style: TextStyle::default(),
+        }];
+        let math = vec![InlineSpan {
+            text: "x = y + z".to_string(),
+            style: TextStyle {
+                math: true,
+                ..TextStyle::default()
+            },
+        }];
+
+        let plain_height = estimate_rich_block_height(&plain, 90, 11.5);
+        let math_height = estimate_rich_block_height(&math, 90, 11.5);
+        assert!(
+            math_height > plain_height,
+            "plain_height={plain_height}, math_height={math_height}"
+        );
+    }
+
+    #[test]
+    fn norm_math_lines_request_tall_enough_room() {
+        let norm = vec![InlineSpan {
+            text: "\\|\\mathbf{x}\\|_2".to_string(),
+            style: TextStyle {
+                math: true,
+                ..TextStyle::default()
+            },
+        }];
+        let height = estimate_rich_line_height(&norm, 11.5);
+        assert!(
+            height >= 20.0,
+            "expected norm notation to reserve enough room, got {height}"
+        );
+    }
+
+    #[test]
+    fn parenthesized_math_lines_are_normalized_to_display_math() {
+        let md = "これは `\\(...\\)` 形式です。\n\n\\( E = mc^2 \\)\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Paragraph(spans) => {
+                let text = plain_text(spans);
+                assert!(text.contains("これは"), "{text}");
+                assert!(spans.iter().any(|s| s.style.code), "{spans:?}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+
+        assert!(
+            matches!(&blocks[1], MarkdownBlock::Spacer { lines: 1 }),
+            "{blocks:?}"
+        );
+
+        match &blocks[2] {
+            MarkdownBlock::DisplayMath(expr) => {
+                assert!(expr.contains("E = mc^2"), "{expr}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn display_math_blocks_render_without_dollars() {
+        let blocks = parse_markdown_blocks("$$\nE = mc^2\n$$\n");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            matches!(&blocks[0], MarkdownBlock::DisplayMath(_)),
+            "{blocks:?}"
+        );
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let pdf_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            pdf_text.contains("/DCTDecode"),
+            "expected JPEG-encoded math image in PDF"
+        );
+        assert!(
+            !pdf_text.contains("/SMask"),
+            "expected no soft mask for math image"
+        );
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("display-math.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+        assert!(
+            loaded.pages.iter().any(|page| !page.images.is_empty()),
+            "expected rendered math to appear as an embedded image"
+        );
+    }
+
+    #[tokio::test]
+    async fn bracket_display_math_blocks_render_without_backslashes() {
+        let blocks = parse_markdown_blocks("\\[\nE = mc^2\n\\]\n");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            matches!(&blocks[0], MarkdownBlock::DisplayMath(expr) if expr.contains("E = mc^2")),
+            "{blocks:?}"
+        );
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let pdf_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            pdf_text.contains("/DCTDecode"),
+            "expected JPEG-encoded math image in PDF"
+        );
+        assert!(
+            !pdf_text.contains("\\["),
+            "expected display math delimiters to be stripped from the PDF"
+        );
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("bracket-display-math.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+        assert!(
+            loaded.pages.iter().any(|page| !page.images.is_empty()),
+            "expected rendered bracket math to appear as an embedded image"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_list_prefixes_are_emitted_in_pdf() {
+        let blocks = parse_markdown_blocks("1. first\n2. second\n");
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("ordered-list.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+        let all_text = loaded
+            .pages
+            .iter()
+            .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(all_text.contains("1."), "{all_text}");
+        assert!(all_text.contains("2."), "{all_text}");
+        assert!(all_text.contains("first"), "{all_text}");
+        assert!(all_text.contains("second"), "{all_text}");
+    }
+
+    #[test]
+    fn wrap_code_lines_preserves_internal_blank_lines() {
+        let wrapped = wrap_code_lines("alpha\n\nbeta\n", 80);
+        assert_eq!(
+            wrapped,
+            vec!["alpha".to_string(), "".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn blockquote_body_width_uses_available_width() {
+        let face = PreviewFace {
+            body: Font::Helvetica,
+            body_bold: Font::HelveticaBold,
+            body_italic: Font::HelveticaOblique,
+            body_bold_italic: Font::HelveticaBoldOblique,
+            emoji: None,
+            emoji_path: None,
+            has_custom_bold: false,
+        };
+        let short = vec![BlockquoteLine::Text(vec![InlineSpan {
+            text: "short quote".to_string(),
+                style: TextStyle::default(),
+            }])];
+
+        let short_width = blockquote_body_width(&short, &face, 11.0);
+
+        assert!(
+            (short_width - (PAGE_WIDTH - 2.0 * MARGIN - 12.0)).abs() < 0.001,
+            "short={short_width}"
+        );
+        assert!(
+            short_width > 0.0,
+            "short={short_width}"
+        );
+    }
+
+    #[test]
+    fn blockquote_long_text_wraps_into_multiple_lines() {
+        let md = format!("> {}\n", "this is a long blockquote line that should wrap because it would otherwise overflow the frame by a large margin");
+        let blocks = parse_markdown_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Blockquote(lines) => {
+                assert!(
+                    lines.len() > 1,
+                    "expected long blockquote text to wrap into multiple lines: {lines:?}"
+                );
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blockquote_paragraphs_collapse_into_one_block() {
+        let md = "> one\n>\n> two\n> > nested\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Blockquote(lines) => {
+                let text = blockquote_plain_text(lines);
+                assert!(text.contains("one"), "{text}");
+                assert!(text.contains("two"), "{text}");
+                assert!(text.contains('>'), "{text}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_blockquote_levels_insert_line_breaks() {
+        let md = "> Level 1\n>\n> > Level 2\n> > > Level 3\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Blockquote(lines) => {
+                let text = blockquote_plain_text(lines);
+                assert!(text.contains("Level 1"), "{text}");
+                assert!(text.contains("Level 2"), "{text}");
+                assert!(text.contains("Level 3"), "{text}");
+                assert!(text.contains('\n'), "{text:?}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn long_blockquote_spans_multiple_pages_in_pdf_and_html() {
+        let md = (1..=120)
+            .map(|i| format!("> quoted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let blocks = parse_markdown_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(matches!(&blocks[0], MarkdownBlock::Blockquote(_)), "{blocks:?}");
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("long-blockquote.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+
+        assert!(
+            loaded.pages.len() > 1,
+            "expected long blockquote to span multiple pages"
+        );
+        let first_page_text = loaded.pages[0]
+            .text_blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let last_page_text = loaded.pages.last().unwrap()
+            .text_blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(first_page_text.contains("quoted line 1"), "{first_page_text}");
+        assert!(
+            last_page_text.contains("quoted line 120"),
+            "{last_page_text}"
+        );
+
+        let html = build_preview_html(&blocks);
+        assert!(
+            html.matches("<blockquote>").count() > 1,
+            "expected blockquote chunks to be split across HTML pages: {html}"
+        );
+        assert!(
+            html.matches("class=\"page\"").count() > 1,
+            "expected HTML preview to span multiple pages for long blockquote: {html}"
+        );
+        assert!(
+            html.contains("overflow-wrap: anywhere"),
+            "expected blockquote CSS to keep long text inside the frame: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blockquote_code_block_is_preserved() {
+        let md = "> before\n>\n> ```js\n> console.log('inside quote');\n> ```\n> after\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        match &blocks[0] {
+            MarkdownBlock::Blockquote(lines) => {
+                assert!(
+                    lines.iter().any(|line| matches!(
+                        line,
+                        BlockquoteLine::CodeBlock { code } if code.contains("inside quote")
+                    )),
+                    "{lines:?}"
+                );
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("blockquote-code-block.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+        let text = loaded
+            .pages
+            .iter()
+            .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("inside quote"), "{text}");
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn emoji_list_items_survive_pdf_and_html_rendering() {
+        let md = [
+            "## 絵文字",
+            "",
+            "- 😀",
+            "- 🚀",
+            "- ✅",
+            "- ⚠️",
+            "- 🧪",
+            "",
+            "日本語 English 123 🚀",
+        ]
+        .join("\n");
+        let blocks = parse_markdown_blocks(&md);
+        assert!(!blocks.is_empty(), "{blocks:?}");
+
+        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let pdf_path = std::env::temp_dir().join("minipdf-emoji-preview.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated emoji preview PDF should be readable");
+
+        assert!(
+            loaded.pages.iter().any(|page| !page.images.is_empty()),
+            "expected emoji preview PDF to embed rasterized emoji images"
+        );
+
+        let extracted = loaded
+            .pages
+            .iter()
+            .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(extracted.contains("絵文字"), "{extracted}");
+
+        let html = build_preview_html(&blocks);
+        assert!(html.contains("😀"), "{html}");
+        assert!(html.contains("🚀"), "{html}");
+        assert!(html.contains("✅"), "{html}");
+    }
+
+    #[test]
+    fn code_block_prefers_single_page_when_it_fits() {
+        assert!(code_block_fits_on_single_page(20.0 * 11.0 + 18.0), "expected short code block to fit on one page");
+        assert!(!code_block_fits_on_single_page(PAGE_HEIGHT), "expected oversized code block to fall back to chunking");
+    }
+
+    #[test]
+    fn thematic_break_variants_are_all_parsed_as_breaks() {
+        let blocks = parse_markdown_blocks("---\n***\n___\n");
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(
+            blocks
+                .iter()
+                .all(|block| matches!(block, MarkdownBlock::ThematicBreak(_))),
+            "{blocks:?}"
+        );
+
+        let html = build_preview_html(&blocks);
+        assert_eq!(html.matches("class=\"hr-hyphen\"").count(), 1, "{html}");
+        assert_eq!(html.matches("class=\"hr-asterisk\"").count(), 1, "{html}");
+        assert_eq!(html.matches("class=\"hr-underscore\"").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn blockquote_display_math_is_preserved_as_a_separate_line() {
+        let md = "> intro\n>\n> $$\n> x = y + z\n> $$\n>\n> outro\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Blockquote(lines) => {
+                assert!(
+                    lines.iter().any(|line| matches!(line, BlockquoteLine::DisplayMath(expr) if expr.contains("x = y + z"))),
+                    "{lines:?}"
+                );
+                let text = blockquote_plain_text(lines);
+                assert!(text.contains("intro"), "{text}");
+                assert!(text.contains("outro"), "{text}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_mmdc_in_ancestor_cwd_node_modules_bin() {
+        let temp_root = std::env::temp_dir().join(format!("minipdf-mmdc-test-{}", Uuid::new_v4()));
+        let nested = temp_root.join("nested").join("child");
+        let bin = temp_root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        #[cfg(windows)]
+        let found_path = {
+            let target = bin.join("mmdc.cmd");
+            std::fs::write(&target, "@echo off\r\nexit /b 0\r\n").unwrap();
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&nested).unwrap();
+            let found = resolve_mmdc_cwd_node_modules_bin();
+            std::env::set_current_dir(original).unwrap();
+            found
+        };
+
+        #[cfg(not(windows))]
+        let found_path = {
+            let target = bin.join("mmdc");
+            std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&nested).unwrap();
+            let found = resolve_mmdc_cwd_node_modules_bin();
+            std::env::set_current_dir(original).unwrap();
+            found
+        };
+
+        assert!(found_path.is_some(), "expected mmdc under ancestor cwd");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn mermaid_cli_can_render_minimal_diagram() {
+        let result = render_mermaid_png("flowchart LR\n  A-->B\n")
+            .expect("mermaid render call should not error");
+        assert!(
+            result.is_some(),
+            "expected mermaid png when mmdc is available"
+        );
+    }
+
+    #[test]
+    fn html_preview_includes_print_page_rules() {
+        let html = build_preview_html(&[MarkdownBlock::Paragraph(vec![InlineSpan {
+            text: "hello".to_string(),
+            style: TextStyle::default(),
+        }])]);
+        assert!(html.contains("@page { size: A4; margin: 0; }"), "{html}");
+        assert!(html.contains("break-after: page"), "{html}");
+        assert!(html.contains("page-break-after: always"), "{html}");
+    }
+
+    #[test]
+    fn html_preview_constrains_mermaid_images_and_fallbacks() {
+        let html = build_preview_html(&[MarkdownBlock::Paragraph(vec![InlineSpan {
+            text: "hello".to_string(),
+            style: TextStyle::default(),
+        }])]);
+
+        assert!(html.contains(".mermaid-frame"), "{html}");
+        assert!(html.contains("max-height: 260pt"), "{html}");
+        assert!(html.contains("page-break-inside: avoid"), "{html}");
+        assert!(html.contains("break-inside: avoid"), "{html}");
+
+        let image_html = mermaid_preview_image_html("Zm9vYmFy");
+        assert!(image_html.contains("mermaid-frame"), "{image_html}");
+        assert!(
+            image_html.contains("data:image/png;base64,Zm9vYmFy"),
+            "{image_html}"
+        );
+
+        let fallback_html = mermaid_preview_fallback_html();
+        assert!(
+            fallback_html.contains("Mermaid diagram preview unavailable"),
+            "{fallback_html}"
+        );
+        assert!(!fallback_html.contains("<pre><code>"), "{fallback_html}");
+    }
+
+    #[test]
+    fn mermaid_fallback_is_short_and_not_a_code_block() {
+        let html = mermaid_preview_fallback_html();
+        assert!(
+            html.contains("Mermaid diagram preview unavailable"),
+            "{html}"
+        );
+        assert!(html.contains("Mermaid CLI を確認してください。"), "{html}");
+        assert!(!html.contains("<pre><code>"), "{html}");
+    }
+
+    #[test]
+    fn normalize_mermaid_jpeg_bytes_flattens_transparency() {
+        let mut png_bytes = Vec::new();
+        let image = ImageBuffer::from_pixel(2, 2, image::Rgba([10, 20, 30, 128]));
+        DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                ImageOutputFormat::Png,
+            )
+            .expect("test png should encode");
+
+        let normalized =
+            normalize_mermaid_jpeg_bytes(&png_bytes).expect("normalization should succeed");
+        let decoded = image::load_from_memory(&normalized).expect("normalized png should decode");
+        assert!(!decoded.color().has_alpha(), "{:?}", decoded.color());
+        assert!(
+            normalized.starts_with(&[0xFF, 0xD8]),
+            "expected JPEG output"
+        );
+    }
+
+    #[tokio::test]
+    async fn mermaid_preview_pdf_does_not_emit_smask() {
+        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+            lang: "mermaid".to_string(),
+            code: "flowchart LR\n  A-->B\n".to_string(),
+        }])
+        .expect("preview PDF should be generated");
+
+        assert!(
+            !bytes.windows(7).any(|w| w == b"/SMask "),
+            "expected Mermaid PDF to avoid soft masks"
+        );
+        assert!(
+            bytes.windows(10).any(|w| w == b"/DCTDecode"),
+            "expected Mermaid PDF image to be JPEG-compressed"
+        );
+
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("mermaid-preview.pdf");
+        std::fs::write(&pdf_path, &bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+        assert_eq!(loaded.pages.len(), 1, "expected a single preview page");
+    }
+
+    #[test]
+    fn fit_mermaid_image_to_page_centers_smaller_diagrams() {
+        let (x, width, height) = fit_mermaid_image_to_page(400.0, 200.0);
+        assert_eq!(width, 300.0);
+        assert_eq!(height, 150.0);
+        assert!((x - 147.5).abs() < 0.01, "x={x}");
+    }
+
+    #[test]
+    fn fit_mermaid_image_to_page_caps_large_diagrams() {
+        let (x, width, height) = fit_mermaid_image_to_page(1200.0, 800.0);
+        assert!((width - 390.0).abs() < 0.01, "width={width}");
+        assert!((x - 102.5).abs() < 0.01, "x={x}");
+        assert!(
+            height <= MERMAID_MAX_DISPLAY_HEIGHT + 0.01,
+            "height={height}"
+        );
+    }
+
+    #[test]
+    fn list_item_content_x_increases_with_prefix_width() {
+        let font = Font::Helvetica;
+        let shallow = list_item_content_x("• ", &font, 11.0);
+        let nested = list_item_content_x("  • ", &font, 11.0);
+        let ordered = list_item_content_x("12. ", &font, 11.0);
+
+        assert!(shallow > MARGIN + 4.0, "shallow={shallow}");
+        assert!(nested > shallow, "nested={nested}, shallow={shallow}");
+        assert!(ordered >= shallow, "ordered={ordered}, shallow={shallow}");
+    }
+
+    #[tokio::test]
+    async fn oversized_first_code_block_does_not_create_a_leading_blank_page() {
+        let code = (0..120)
+            .map(|i| format!("line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+            lang: "text".to_string(),
+            code,
+        }])
+        .expect("preview PDF should be generated");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("oversized-code-block.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+
+        assert!(!loaded.pages.is_empty(), "expected at least one page");
+        assert!(
+            !loaded.pages[0].text_blocks.is_empty(),
+            "expected the first page to contain code block content instead of being blank"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_code_block_spans_multiple_pages() {
+        let code = (0..260)
+            .map(|i| format!("line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+            lang: "text".to_string(),
+            code,
+        }])
+        .expect("preview PDF should be generated");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("long-code-block.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+
+        assert!(
+            loaded.pages.len() >= 2,
+            "expected a long code block to flow onto multiple pages"
+        );
+        assert!(
+            loaded.pages.iter().all(|page| !page.text_blocks.is_empty()),
+            "expected every rendered page to contain some code text"
+        );
     }
 }

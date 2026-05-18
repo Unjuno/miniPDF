@@ -13,10 +13,14 @@ miniPDF は、Markdown を編集しながら **PDF のライブプレビュー**
 
 1. この README（概要・セットアップ）
 2. [docs/FEATURES.md](./docs/FEATURES.md)（操作）
-3. [docs/SPECIFICATION.md](./docs/SPECIFICATION.md)（仕様・IPC）
-4. [docs/CURRENT_ISSUES_SUMMARY.md](./docs/CURRENT_ISSUES_SUMMARY.md)（既知の問題の正本）
-5. [docs/INDEX.md](./docs/INDEX.md)（全体索引）
-6. [docs/RELEASING.md](./docs/RELEASING.md)（CI・インストーラー配布）
+3. [docs/HTML_PREVIEW.md](./docs/HTML_PREVIEW.md)（HTML ベースのプレビュー実装メモ）
+4. [docs/markdown-editor-preview-sync.md](./docs/markdown-editor-preview-sync.md)（エディタとプレビューの位置同期メモ）
+5. [docs/markdown-katex-rendering.md](./docs/markdown-katex-rendering.md)（KaTeX 数式レンダリングメモ）
+6. [docs/markdown-preview-cli.md](./docs/markdown-preview-cli.md)（Markdown から PDF を出力する CLI）
+7. [docs/SPECIFICATION.md](./docs/SPECIFICATION.md)（仕様・IPC）
+8. [docs/CURRENT_ISSUES_SUMMARY.md](./docs/CURRENT_ISSUES_SUMMARY.md)（既知の問題の正本）
+9. [docs/INDEX.md](./docs/INDEX.md)（全体索引）
+10. [docs/RELEASING.md](./docs/RELEASING.md)（CI・インストーラー配布）
 
 ### 解決する問題
 
@@ -146,6 +150,10 @@ AGPL-3.0 License - 詳細は [LICENSE](./LICENSE) を参照してください。
 ### 基本ドキュメント
 
 - **[docs/FEATURES.md](./docs/FEATURES.md)** - **機能説明書（ユーザー向け）** ⭐ - 機能の詳細と操作方法
+- **[docs/HTML_PREVIEW.md](./docs/HTML_PREVIEW.md)** - HTML ベースの Markdown プレビュー実装メモ
+- **[docs/markdown-editor-preview-sync.md](./docs/markdown-editor-preview-sync.md)** - Markdown エディタとプレビューの位置同期メモ
+- **[docs/markdown-katex-rendering.md](./docs/markdown-katex-rendering.md)** - KaTeX 数式レンダリングメモ
+- **[docs/markdown-preview-cli.md](./docs/markdown-preview-cli.md)** - Markdown から PDF を出力する CLI
 - **[docs/CONCEPT.md](./docs/CONCEPT.md)** - プロジェクトのコンセプト・設計思想
 - **[docs/SPECIFICATION.md](./docs/SPECIFICATION.md)** - 機能仕様・実装方法（実装時の主要参照文書）
 - **[docs/DO_NOT.md](./docs/DO_NOT.md)** - やらないこと制約リスト（プロジェクトのスコープと制約事項）

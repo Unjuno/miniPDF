@@ -56,6 +56,12 @@ describe('pdfStore', () => {
       zoomLevel: 1,
       error: null,
       currentPage: 1,
+      markdownText: '',
+      isPreviewBuilding: false,
+      previewError: null,
+      previewPdfPath: null,
+      previewHtml: null,
+      previewRequestId: 0,
       isLoading: false,
       isEditing: false,
     });
@@ -569,6 +575,35 @@ describe('pdfStore', () => {
     expect(usePdfStore.getState().zoomLevel).toBe(1);
   });
 
+  it('markdown preview reload can preserve the current page', async () => {
+    const mockedInvoke = invoke as unknown as Mock;
+    const mockedReadFile = readFile as unknown as Mock;
+
+    mockedInvoke.mockResolvedValue({
+      metadata: {},
+      pages: [
+        {
+          pageNumber: 1,
+          width: 595,
+          height: 842,
+          images: [],
+          textBlocks: [],
+        },
+      ],
+    });
+    mockedReadFile.mockResolvedValue(new Uint8Array([1, 2, 3]));
+    mockExtractTextWithPDFjs.mockResolvedValue([
+      { id: 'text_1_0', x: 0, y: 0, width: 10, height: 10, text: 'hi', fontSize: 12, lineHeight: 1.2, fontFamily: 'Arial' },
+    ]);
+    mockExtractImageAreasWithPDFjs.mockResolvedValue([]);
+
+    usePdfStore.setState({ currentPage: 3 });
+
+    await usePdfStore.getState().loadPdf('dummy.pdf', { preserveCurrentPage: true });
+
+    expect(usePdfStore.getState().currentPage).toBe(3);
+  });
+
   it('ブラウザモードではMarkdownプレビュー生成をスキップする', async () => {
     const mockedInvoke = invoke as unknown as Mock;
     const tauriWindow = globalThis.window as Window & { __TAURI__?: unknown; __TAURI_INTERNALS__?: unknown };
@@ -591,13 +626,102 @@ describe('pdfStore', () => {
     const result = await usePdfStore.getState().requestMarkdownPreview('# ok', 2);
 
     expect(result).toBe('C:/temp/preview.pdf');
+    expect(mockedInvoke).toHaveBeenCalledTimes(1);
     expect(mockedInvoke).toHaveBeenCalledWith('render_markdown_to_pdf_preview', {
       markdown: '# ok',
     });
     expect(usePdfStore.getState().previewPdfPath).toBe('C:/temp/preview.pdf');
+    expect(usePdfStore.getState().previewHtml).toBeNull();
     expect(usePdfStore.getState().previewError).toBeNull();
 
     delete tauriWindow.__TAURI__;
   });
-});
 
+  it('previewPdfPathが現在のPDFと一致するときはそのPDFをそのまま保存する', async () => {
+    const mockedInvoke = invoke as unknown as Mock;
+    const mockedReadFile = readFile as unknown as Mock;
+
+    const previewBytes = new Uint8Array([37, 80, 68, 70]);
+    mockedReadFile.mockResolvedValue(previewBytes);
+
+    usePdfStore.setState({
+      pdfStructure: {
+        filePath: 'C:/temp/preview.pdf',
+        metadata: {},
+        pages: [
+          {
+            pageNumber: 1,
+            width: 595,
+            height: 842,
+            images: [],
+            textBlocks: [],
+          },
+        ],
+      } as PdfStructure,
+      previewPdfPath: 'C:/temp/preview.pdf',
+    });
+
+    mockedInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'save_pdf') {
+        return Promise.resolve(undefined);
+      }
+      return Promise.resolve([]);
+    });
+
+    await usePdfStore.getState().savePdf('C:/temp/output.pdf');
+
+    expect(mockedReadFile).toHaveBeenCalledWith('C:/temp/preview.pdf');
+    expect(mockedInvoke).toHaveBeenCalledWith('save_pdf', {
+      filePath: 'C:/temp/output.pdf',
+      pdfData: previewBytes,
+    });
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      'generate_pdf',
+      expect.anything()
+    );
+  });
+
+  it('画像データが空の読み込み済みPDFは元ファイルをそのまま保存する', async () => {
+    const mockedInvoke = invoke as unknown as Mock;
+    const mockedReadFile = readFile as unknown as Mock;
+
+    const sourceBytes = new Uint8Array([37, 80, 68, 70, 45, 49, 46, 55]);
+    mockedReadFile.mockResolvedValue(sourceBytes);
+
+    usePdfStore.setState({
+      pdfStructure: {
+        filePath: 'C:/docs/source.pdf',
+        metadata: {},
+        pages: [
+          {
+            pageNumber: 1,
+            width: 595,
+            height: 842,
+            images: [],
+            textBlocks: [],
+          },
+        ],
+      } as PdfStructure,
+      previewPdfPath: null,
+    });
+
+    mockedInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'save_pdf') {
+        return Promise.resolve(undefined);
+      }
+      return Promise.resolve([]);
+    });
+
+    await usePdfStore.getState().savePdf('C:/docs/output.pdf');
+
+    expect(mockedReadFile).toHaveBeenCalledWith('C:/docs/source.pdf');
+    expect(mockedInvoke).toHaveBeenCalledWith('save_pdf', {
+      filePath: 'C:/docs/output.pdf',
+      pdfData: sourceBytes,
+    });
+    expect(mockedInvoke).not.toHaveBeenCalledWith(
+      'generate_pdf',
+      expect.anything()
+    );
+  });
+});

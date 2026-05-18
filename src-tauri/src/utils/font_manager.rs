@@ -3,7 +3,6 @@
 /// alt: 標準フォントのみを使用（日本語が文字化けする）
 /// evidence: oxidize-pdfはカスタムフォントの埋め込みをサポートしている
 /// assumption: フォントファイルはsrc-tauri/fonts/ディレクトリに配置される
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -26,35 +25,36 @@ impl FontRegistry {
         // alt: 絶対パスを使用（デプロイ時に問題が発生する）
         // evidence: 実行ファイルのディレクトリから相対パスで取得することで、デプロイ先でも動作する
         let font_dir = if let Ok(exe_dir) = std::env::current_exe() {
-            exe_dir.parent()
+            exe_dir
+                .parent()
                 .map(|p| p.join("fonts"))
                 .unwrap_or_else(|| PathBuf::from("fonts"))
         } else {
             PathBuf::from("fonts")
         };
-        
+
         Self {
             fonts: HashMap::new(),
             font_dir,
         }
     }
-    
+
     /// フォントを登録
     fn register_font(&mut self, name: String, font_path: PathBuf) {
         self.fonts.insert(name, font_path);
     }
-    
+
     /// フォントパスを取得
     fn get_font_path(&self, name: &str) -> Option<&PathBuf> {
         self.fonts.get(name)
     }
-    
+
     /// フォントディレクトリを取得
     #[allow(dead_code)]
     fn font_dir(&self) -> &Path {
         &self.font_dir
     }
-    
+
     /// 利用可能なフォントを初期化
     fn initialize_default_fonts(&mut self) {
         // why: デフォルトの日本語フォントを登録（Noto Sans JPなど）
@@ -65,7 +65,7 @@ impl FontRegistry {
             ("NotoSansJP-Bold", "NotoSansJP-Bold.ttf"),
             ("NotoSerifJP", "NotoSerifJP-Regular.ttf"),
         ];
-        
+
         for (name, filename) in default_fonts {
             let font_path = resolve_font_path(&self.font_dir, filename);
             if let Some(font_path) = font_path {
@@ -77,7 +77,9 @@ impl FontRegistry {
                     "フォントファイルが見つかりません: {} (検索: {:?}, {:?})",
                     filename,
                     self.font_dir.join(filename),
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts").join(filename)
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("fonts")
+                        .join(filename)
                 );
             }
         }
@@ -93,6 +95,22 @@ impl FontRegistry {
                     }
                     Err(e) => warn!(
                         "システムフォントを PDF 用に読み込めませんでした（スキップ）: {:?} — {}",
+                        p, e
+                    ),
+                }
+            }
+        }
+
+        if !self.fonts.contains_key("Emoji") {
+            if let Some(p) = system_fallback_emoji_font() {
+                match oxidize_pdf::fonts::FontLoader::load_from_file(&p) {
+                    Ok(_) => {
+                        let p2 = p.clone();
+                        self.register_font("Emoji".to_string(), p);
+                        info!("システム絵文字フォントを Emoji として登録しました: {:?}", p2);
+                    }
+                    Err(e) => warn!(
+                        "システム絵文字フォントを PDF 用に読み込めませんでした（スキップ）: {:?} — {}",
                         p, e
                     ),
                 }
@@ -140,9 +158,30 @@ fn system_fallback_japanese_sans() -> Option<PathBuf> {
     None
 }
 
+/// 絵文字や記号の表示を補うためのシステムフォントを探す。
+fn system_fallback_emoji_font() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        let fonts = Path::new(&windir).join("Fonts");
+        // why: Segoe UI Emoji は `🧪` のような広い絵文字集合を持つため、
+        //      まずこちらを試してから、記号系の Segoe UI Symbol に落とす
+        // alt: seguisym.ttf を先に使う（カバー範囲が狭く、絵文字が抜けやすい）
+        let candidates = [fonts.join("seguiemj.ttf"), fonts.join("seguisym.ttf")];
+        for p in candidates {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// 実行ファイル隣接の `fonts/` に加え、開発時は `src-tauri/fonts/`（Cargo マニフェスト直下）も参照する。
 fn resolve_font_path(exe_font_dir: &Path, filename: &str) -> Option<PathBuf> {
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts").join(filename);
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fonts")
+        .join(filename);
     if dev.exists() {
         return Some(dev);
     }
@@ -160,7 +199,10 @@ pub fn register_fonts_on_document(doc: &mut Document) -> Result<(), String> {
             continue;
         };
         match doc.add_font(&font_name, &path) {
-            Ok(()) => info!("PDF にフォントを埋め込みました: {} -> {:?}", font_name, path),
+            Ok(()) => info!(
+                "PDF にフォントを埋め込みました: {} -> {:?}",
+                font_name, path
+            ),
             Err(e) => warn!("フォントの埋め込みに失敗しました {}: {}", font_name, e),
         }
     }
@@ -233,5 +275,35 @@ mod tests {
             r.err()
         );
     }
-}
 
+    /// Windows の絵文字フォントがあれば oxidize が読めること。
+    #[cfg(windows)]
+    #[test]
+    fn emoji_font_loads_when_present() {
+        let Some(p) = super::system_fallback_emoji_font() else {
+            return;
+        };
+        let r = oxidize_pdf::fonts::FontLoader::load_from_file(&p);
+        assert!(
+            r.is_ok(),
+            "emoji font should be loadable for PDF preview: {:?} — {:?}",
+            p,
+            r.err()
+        );
+    }
+
+    /// Windows では広い絵文字カバレッジを持つ Segoe UI Emoji を優先する。
+    #[cfg(windows)]
+    #[test]
+    fn emoji_font_prefers_seguiemj_when_available() {
+        let Some(p) = super::system_fallback_emoji_font() else {
+            return;
+        };
+        let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert_eq!(
+            fname.to_ascii_lowercase(),
+            "seguiemj.ttf",
+            "expected Segoe UI Emoji to be preferred for broader emoji coverage"
+        );
+    }
+}

@@ -47,6 +47,7 @@ miniPDF/
 - `CONCEPT.md` - プロジェクトのコンセプト・設計思想
 - `SPECIFICATION.md` - 機能仕様・実装方法（実装時の主要参照文書）
 - `FEATURES.md` - 機能説明書（ユーザー向け）⭐
+- `markdown-preview-cli.md` - Markdown を PDF に出力する CLI
 - `DO_NOT.md` - やらないこと制約リスト
 
 #### 実装・検証ドキュメント
@@ -67,6 +68,7 @@ miniPDF/
 - `page-reorder-dnd.md` - ページ並び替えのドラッグアンドドロップ
 - `preview-blank-page-render.md` - プレビューの空白ページレンダリング
 - `preview-reorder-not-updating.md` - プレビューの並び替え更新
+- `20260519-thematic-break-style-variants.md` - 水平線の記法ごとの差分レンダリング
 - `readme-missing-links.md` - READMEのリンク不足
 - `zoom-minus-button.md` - ズームマイナスボタン
 
@@ -196,7 +198,6 @@ miniPDF/
 ### その他のファイル
 
 - `index.html` - HTMLエントリーポイント
-- `image.png` - プロジェクト画像
 - `mian.pdf` - テスト用PDFファイル（typoあり、実際のテストで使用されている）
 
 ### 開発用ファイル
@@ -233,12 +234,12 @@ miniPDF/
 
 ### ドキュメント
 
-- Markdownファイル: 24ファイル
+- Markdownファイル: 25ファイル
   - ルート: 2ファイル（README.md, AGENTS.md）
-  - docs/: 21ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, バグノート6ファイル）
+  - docs/: 23ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート6ファイル）
   - .playwright-mcp/: 1ファイル（ui-test-snapshot.md）
   - src-tauri/fonts/: 1ファイル（README.md）
-- バグノート: 6ファイル（docs/bugs/）
+- バグノート: 7ファイル（docs/bugs/）
 
 ### ソースコード
 
@@ -269,4 +270,3 @@ miniPDF/
 - [COMPLETE_FILE_LIST.md](./COMPLETE_FILE_LIST.md) - 完全ファイルリスト（全ファイルの詳細リスト）
 - [INDEX.md](./INDEX.md) - ドキュメント索引
 - [README.md](../README.md) - プロジェクト基本情報
-

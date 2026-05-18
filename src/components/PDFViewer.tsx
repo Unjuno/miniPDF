@@ -14,6 +14,10 @@ import './PDFViewer.css';
 // evidence: PDF.jsは数MBのサイズがあり、起動時間に大きく影響する
 // assumption: ユーザーがPDFを開くまでPDF.jsは不要
 let pdfjsLib: typeof import('pdfjs-dist') | null = null;
+type PdfDocumentLoadingTaskLike = {
+  promise: Promise<import('pdfjs-dist').PDFDocumentProxy>;
+  destroy: () => Promise<void>;
+};
 const loadPdfJs = async () => {
   if (!pdfjsLib) {
     pdfjsLib = await import('pdfjs-dist');
@@ -472,7 +476,7 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
     // alt: フラグなし（メモリリークが発生する可能性がある）
     // evidence: フラグにより、非同期処理中にコンポーネントがアンマウントされた場合に処理をスキップできる
     let cancelled = false;
-    let loadingTask: import('pdfjs-dist').PDFLoadingTask | null = null;
+    let loadingTask: PdfDocumentLoadingTaskLike | null = null;
     
     if (shouldReloadPdf) {
       // PDFファイルパスが変更された場合のみPDFを再読み込み
@@ -502,7 +506,7 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
           // evidence: キャッシュにより読み込み時間が短縮される
           disableAutoFetch: false,
           disableStream: false,
-        });
+        }) as unknown as PdfDocumentLoadingTaskLike;
         
         const pdf = await loadingTask.promise;
         if (cancelled) {
@@ -585,9 +589,6 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
               renderBlankPage(canvasRef.current, firstPage.width, firstPage.height, zoomLevel);
             }
           }
-          if (!cancelled) {
-            setCurrentPageInStore(1);
-          }
         }
       } catch (error) {
         if (cancelled) return;
@@ -620,17 +621,22 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
     return () => {
       // why: クリーンアップ関数で非同期処理をキャンセルしてメモリリークを防ぐ
       // alt: キャンセルしない（非同期処理が完了するまで待つ）
-      // evidence: キャンセルフラグとloadingTaskのキャンセルにより、メモリリークを防ぐ
+      // evidence: キャンセルフラグとloadingTaskの破棄により、メモリリークを防ぐ
       cancelled = true;
-      if (loadingTask) {
+      const currentLoadingTask = loadingTask;
+      loadingTask = null;
+      if (currentLoadingTask) {
         try {
-          // why: loadingTaskをキャンセルしてリソースを解放する
-          // alt: キャンセルしない（リソースが解放されない可能性がある）
-          // evidence: loadingTask.cancel()により、PDF.jsの読み込み処理がキャンセルされる
-          loadingTask.cancel();
+          // why: PDF.jsの読み込みタスクは destroy() で破棄する
+          // alt: cancel() を呼ぶ（現在のPDF.js APIには存在しない）
+          // evidence: pdfjs-dist の PDFDocumentLoadingTask は destroy() を提供する
+          void currentLoadingTask.destroy().catch((error: unknown) => {
+            // 既に破棄されている場合はエラーを無視
+            logger.warn('Failed to destroy loading task', { error });
+          });
         } catch (error) {
-          // 既にキャンセルされている場合はエラーを無視
-          logger.warn('Failed to cancel loading task', { error });
+          // 既に破棄されている場合はエラーを無視
+          logger.warn('Failed to destroy loading task', { error });
         }
       }
       // why: pdfDocRefを使用して最新のpdfDocを参照する（クロージャの問題を回避）
@@ -844,14 +850,16 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
     
     if (currentPage > maxPage) {
       // 削除されたページが現在表示中のページの場合、最後のページに調整
+      setCurrentPageInStore(maxPage);
       setCurrentPage(maxPage);
       onPageChange?.(maxPage);
     } else if (currentPage < 1) {
       // ページ番号が1未満の場合、1ページ目に調整
+      setCurrentPageInStore(1);
       setCurrentPage(1);
       onPageChange?.(1);
     }
-  }, [pdfStructure, currentPage, onPageChange]);
+  }, [pdfStructure, currentPage, onPageChange, setCurrentPageInStore]);
 
   // オーバーレイのスケール計算をメモ化
   // why: canvasRefの値を直接参照すると再レンダリングが頻繁に発生するため、useStateで管理

@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "vitest",
+    "markdown:preview": "cargo run --manifest-path src-tauri/Cargo.toml --bin markdown_preview_cli --",
+    "test": "vitest --run",
     "test:ui": "vitest --ui",
     "test:coverage": "vitest --coverage"
   },

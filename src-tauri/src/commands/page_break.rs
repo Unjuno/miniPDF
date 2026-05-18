@@ -1,5 +1,5 @@
-use tauri::command;
 use crate::models::pdf_structure::PdfStructure;
+use tauri::command;
 
 #[command]
 pub async fn adjust_page_break(
@@ -8,19 +8,21 @@ pub async fn adjust_page_break(
     new_position: f64,
 ) -> Result<PdfStructure, String> {
     let mut pdf = pdf_structure;
-    
+
     if page_number == 0 || page_number > pdf.pages.len() as u32 {
         return Err(format!("無効なページ番号: {page_number}"));
     }
 
     let page_index = (page_number - 1) as usize;
     let page = &pdf.pages[page_index];
-    
+
     // 最小ページ高さの制約（ページサイズの10%）
     let min_page_height = page.height * 0.1;
     if new_position < min_page_height || new_position > page.height - min_page_height {
-        return Err(format!("改ページ位置が範囲外です。最小ページ高さ: {min_page_height:.1}pt, 最大: {:.1}pt", 
-            page.height - min_page_height));
+        return Err(format!(
+            "改ページ位置が範囲外です。最小ページ高さ: {min_page_height:.1}pt, 最大: {:.1}pt",
+            page.height - min_page_height
+        ));
     }
 
     // 改ページ位置を調整（現在のページの高さを変更）
@@ -34,13 +36,19 @@ pub async fn adjust_page_break(
     let page = &pdf.pages[page_index];
     for image in &page.images {
         if image.y + image.height > page.height {
-            return Err(format!("画像がページ範囲外に出ます: 画像ID {image_id}", image_id = image.id));
+            return Err(format!(
+                "画像がページ範囲外に出ます: 画像ID {image_id}",
+                image_id = image.id
+            ));
         }
     }
-    
+
     for text_block in &page.text_blocks {
         if text_block.y + text_block.height > page.height {
-            return Err(format!("テキストブロックがページ範囲外に出ます: テキストブロックID {text_block_id}", text_block_id = text_block.id));
+            return Err(format!(
+                "テキストブロックがページ範囲外に出ます: テキストブロックID {text_block_id}",
+                text_block_id = text_block.id
+            ));
         }
     }
 

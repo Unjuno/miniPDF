@@ -7,6 +7,6 @@ fn main() {
         println!("cargo:warning=Skipping Tauri build for tests");
         return;
     }
-    
+
     tauri_build::build();
 }

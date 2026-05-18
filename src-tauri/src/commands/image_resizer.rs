@@ -1,8 +1,8 @@
-use tauri::command;
 use crate::models::pdf_structure::ImageElement;
-use base64::{Engine as _, engine::general_purpose};
 use anyhow::Context;
+use base64::{engine::general_purpose, Engine as _};
 use image;
+use tauri::command;
 
 #[command]
 pub async fn resize_image(
@@ -24,11 +24,16 @@ pub async fn resize_image(
     let img = image::load_from_memory(&image_bytes)
         .context("画像データの読み込みに失敗しました")
         .map_err(|e| format!("{e}"))?;
-    let resized = img.resize_exact(new_width as u32, new_height as u32, image::imageops::FilterType::Lanczos3);
-    
+    let resized = img.resize_exact(
+        new_width as u32,
+        new_height as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+
     let mut buffer = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buffer);
-    resized.write_to(&mut cursor, image::ImageOutputFormat::Png)
+    resized
+        .write_to(&mut cursor, image::ImageOutputFormat::Png)
         .with_context(|| format!("画像のリサイズに失敗しました (size: {new_width}x{new_height})"))
         .map_err(|e| format!("{e}"))?;
 

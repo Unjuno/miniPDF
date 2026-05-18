@@ -2,7 +2,6 @@
 /// why: 構造化ログでバグを特定しやすくする
 /// alt: println!を直接使用（ログレベル制御ができない）
 /// evidence: 構造化ログにより、ログレベルでフィルタリングできる
-
 use log::{debug, error, info};
 
 /// why: ログを初期化（環境変数からログレベルを設定）
@@ -13,12 +12,16 @@ pub fn init_logger() {
     // alt: ログレベルを固定（デバッグ時に不便）
     // evidence: 環境変数からログレベルを設定することで、実行時に制御できる
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        if cfg!(debug_assertions) { "debug" } else { "info" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "info"
+        },
     ))
-        .format_timestamp_secs()
-        .format_module_path(false)
-        .format_target(false)
-        .init();
+    .format_timestamp_secs()
+    .format_module_path(false)
+    .format_target(false)
+    .init();
 }
 
 /// why: エラーログを記録（エラー発生時の詳細情報を記録）
@@ -63,4 +66,3 @@ pub fn log_operation_complete(operation: &str, context: Option<&str>) {
         debug!("{} completed", operation);
     }
 }
-
