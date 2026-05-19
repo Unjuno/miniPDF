@@ -35,7 +35,6 @@ const EMOJI_RASTER_PX_PER_PT: f32 = 6.0;
 const EMOJI_DISPLAY_SCALE: f64 = 1.45;
 // PDF の座標は pt なので、いったん追加オフセットなしに戻す。
 const EMOJI_VERTICAL_ADJUST_PT: f64 = 0.0;
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TextStyle {
     bold: bool,
@@ -1804,8 +1803,11 @@ struct PreviewFace {
     body_bold: Font,
     body_italic: Font,
     body_bold_italic: Font,
+    body_path: Option<PathBuf>,
+    body_bold_path: Option<PathBuf>,
     emoji: Option<Font>,
     emoji_path: Option<PathBuf>,
+    has_custom_bold_italic: bool,
     /// `NotoSansJP-Bold` が埋め込まれている（Helvetica 系で日本語太字にしない）
     has_custom_bold: bool,
 }
@@ -1827,13 +1829,16 @@ impl PreviewFace {
         }
         let non_ascii = !ascii_only(text);
         match (style.bold, style.italic) {
-            (true, _) if non_ascii => {
+            (true, true) if non_ascii => {
                 if self.has_custom_bold {
-                    if style.italic {
-                        self.body_bold_italic.clone()
-                    } else {
-                        self.body_bold.clone()
-                    }
+                    self.body_bold.clone()
+                } else {
+                    self.body.clone()
+                }
+            }
+            (true, false) if non_ascii => {
+                if self.has_custom_bold {
+                    self.body_bold.clone()
                 } else {
                     self.body.clone()
                 }
@@ -1846,7 +1851,9 @@ impl PreviewFace {
                 }
             }
             (true, true) => {
-                if self.has_custom_bold {
+                if self.has_custom_bold_italic {
+                    self.body_bold_italic.clone()
+                } else if self.has_custom_bold {
                     self.body_bold_italic.clone()
                 } else {
                     Font::HelveticaBoldOblique
@@ -1860,6 +1867,9 @@ impl PreviewFace {
 }
 
 fn is_potential_bold_face(face: &PreviewFace, style: TextStyle, text: &str) -> bool {
+    if style.bold && style.italic && !ascii_only(text) {
+        return !face.has_custom_bold_italic;
+    }
     style.bold && !ascii_only(text) && !face.has_custom_bold
 }
 
@@ -1872,7 +1882,7 @@ fn draw_fake_bold_text(
     y: f64,
     fill: Color,
 ) -> Result<(), String> {
-    let offsets = [0.0_f64, 0.18, 0.36];
+    let offsets = [0.0_f64, 0.24, 0.48];
     for dx in offsets {
         page.text()
             .set_fill_color(fill)
@@ -1890,6 +1900,8 @@ fn ascii_only(s: &str) -> bool {
 
 fn make_preview_face(doc: &Document, body: Font) -> PreviewFace {
     let has_bold = doc.has_custom_font(JP_SANS_BOLD);
+    let body_path = font_manager::get_font_path(JP_SANS_FONT);
+    let body_bold_path = font_manager::get_font_path(JP_SANS_BOLD).or_else(|| body_path.clone());
     PreviewFace {
         body: body.clone(),
         body_bold: if has_bold {
@@ -1897,18 +1909,27 @@ fn make_preview_face(doc: &Document, body: Font) -> PreviewFace {
         } else {
             body.clone()
         },
-        body_italic: Font::HelveticaOblique,
-        body_bold_italic: if has_bold {
+        body_italic: if doc.has_custom_font("NotoSansJP-Italic") {
+            Font::custom("NotoSansJP-Italic")
+        } else {
+            Font::HelveticaOblique
+        },
+        body_bold_italic: if doc.has_custom_font("NotoSansJP-BoldItalic") {
+            Font::custom("NotoSansJP-BoldItalic")
+        } else if has_bold {
             Font::custom(JP_SANS_BOLD)
         } else {
             body.clone()
         },
+        body_path,
+        body_bold_path,
         emoji: if doc.has_custom_font(EMOJI_FONT) {
             Some(Font::custom(EMOJI_FONT))
         } else {
             None
         },
         emoji_path: font_manager::get_font_path(EMOJI_FONT),
+        has_custom_bold_italic: doc.has_custom_font("NotoSansJP-BoldItalic"),
         has_custom_bold: has_bold,
     }
 }
@@ -2461,11 +2482,29 @@ fn draw_text_segment(
     fill: Color,
 ) -> Result<f64, String> {
     let needs_fake_bold = is_potential_bold_face(face, seg.style, &seg.text);
-    let needs_fake_italic = should_fake_italic(seg.style, &seg.text);
+    let needs_fake_italic = should_fake_italic(face, seg.style, &seg.text);
     let width = measure_text_segment_width(face, rendered_text, seg.style, font, size);
 
+    if should_raster_faux_italic(face, seg.style, rendered_text) {
+        if let Some(rendered) =
+            rasterize_faux_italic_text(face, rendered_text, seg.style, size, fill)?
+        {
+            let draw_y = y - rendered.baseline_offset_pt;
+            draw_image_on_page(
+                page,
+                &rendered.jpeg_data,
+                "jpeg",
+                x,
+                draw_y,
+                rendered.width_pt,
+                rendered.height_pt,
+            )?;
+            return Ok(raster_faux_italic_advance_width(&rendered));
+        }
+    }
+
     if needs_fake_italic && !text_has_emoji(rendered_text) {
-        return draw_faux_italic_text(
+        let draw_width = draw_faux_italic_text(
             page,
             rendered_text,
             font.clone(),
@@ -2473,9 +2512,9 @@ fn draw_text_segment(
             x,
             y,
             fill,
-            needs_fake_bold,
-        )
-        .map(|_| width);
+            seg.style.bold,
+        )?;
+        return Ok(draw_width.max(width));
     }
 
     if needs_fake_bold && !text_has_emoji(rendered_text) {
@@ -2508,7 +2547,7 @@ fn draw_mixed_emoji_text(
     fill: Color,
 ) -> Result<(), String> {
     let mut cursor_x = x;
-    for (idx, grapheme) in UnicodeSegmentation::graphemes(text, true).enumerate() {
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
         let draw_size = if seg.style.code {
             (size - 1.0).max(8.5)
         } else {
@@ -2536,21 +2575,30 @@ fn draw_mixed_emoji_text(
         }
         let font = font_for_grapheme(face, seg.style, grapheme);
         let w = approx_width_pt(grapheme, &font, draw_size);
-        let draw_x = if should_fake_italic_grapheme(seg.style, grapheme) {
-            cursor_x + faux_italic_skew(idx, draw_size)
-        } else {
-            cursor_x
-        };
         let needs_fake_bold = is_potential_bold_face(face, seg.style, grapheme);
+        if should_fake_italic_grapheme(face, seg.style, grapheme) {
+            let draw_width = draw_faux_italic_text(
+                page,
+                grapheme,
+                font.clone(),
+                draw_size,
+                cursor_x,
+                y,
+                fill,
+                seg.style.bold,
+            )?;
+            cursor_x += draw_width.max(w);
+            continue;
+        }
         if needs_fake_bold {
-            draw_fake_bold_text(page, grapheme, font.clone(), draw_size, draw_x, y, fill)?;
+            draw_fake_bold_text(page, grapheme, font.clone(), draw_size, cursor_x, y, fill)?;
             cursor_x += w;
             continue;
         }
         page.text()
             .set_fill_color(fill)
             .set_font(font, draw_size)
-            .at(draw_x, y)
+            .at(cursor_x, y)
             .write(grapheme)
             .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
         cursor_x += w;
@@ -2630,7 +2678,7 @@ fn grapheme_has_emoji(grapheme: &str) -> bool {
     })
 }
 
-fn emoji_font_data(path: &Path) -> Option<Arc<[u8]>> {
+fn font_data(path: &Path) -> Option<Arc<[u8]>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<[u8]>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().ok()?;
@@ -2650,7 +2698,7 @@ fn rasterize_emoji_grapheme(
     let Some(path) = &face.emoji_path else {
         return Ok(None);
     };
-    let Some(data) = emoji_font_data(path) else {
+    let Some(data) = font_data(path) else {
         return Ok(None);
     };
     let Some(font) = FontRef::from_index(data.as_ref(), 0) else {
@@ -2734,6 +2782,247 @@ fn emoji_draw_y(y: f64, baseline_offset_pt: f64) -> f64 {
     y - baseline_offset_pt - EMOJI_VERTICAL_ADJUST_PT
 }
 
+struct RasterizedFauxItalicText {
+    jpeg_data: Vec<u8>,
+    width_pt: f64,
+    height_pt: f64,
+    baseline_offset_pt: f64,
+}
+
+struct GlyphBitmap {
+    data: Vec<u8>,
+    is_mask: bool,
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    advance: f32,
+}
+
+fn should_raster_faux_italic(face: &PreviewFace, style: TextStyle, text: &str) -> bool {
+    style.italic
+        && !style.code
+        && !style.math
+        && !ascii_only(text)
+        && !text_has_emoji(text)
+        && face.body_path.is_some()
+}
+
+fn raster_faux_italic_advance_width(rendered: &RasterizedFauxItalicText) -> f64 {
+    rendered.width_pt
+}
+
+fn raster_faux_italic_baseline_offset(height_pt: f64, baseline_from_top_pt: f64) -> f64 {
+    (height_pt - baseline_from_top_pt).max(0.0)
+}
+
+fn rasterize_faux_italic_text(
+    face: &PreviewFace,
+    text: &str,
+    style: TextStyle,
+    size: f64,
+    fill: Color,
+) -> Result<Option<RasterizedFauxItalicText>, String> {
+    let font_path = if style.bold {
+        face.body_bold_path.as_ref().or(face.body_path.as_ref())
+    } else {
+        face.body_path.as_ref()
+    };
+    let Some(font_path) = font_path else {
+        return Ok(None);
+    };
+    let Some(data) = font_data(font_path) else {
+        return Ok(None);
+    };
+    let Some(font) = FontRef::from_index(data.as_ref(), 0) else {
+        return Ok(None);
+    };
+
+    let pixels_per_pt = EMOJI_RASTER_PX_PER_PT;
+    let px_size = (size as f32) * pixels_per_pt;
+    let mut context = ScaleContext::new();
+    let mut scaler = context.builder(font).size(px_size).build();
+    let metrics = font.glyph_metrics(&[]).scale(px_size);
+    let mut glyphs = Vec::new();
+    let mut top_max = 0_i32;
+    let mut bottom_max = 0_i32;
+    let mut advance_total = 0.0_f32;
+
+    for ch in text.chars() {
+        let glyph_id = font.charmap().map(ch);
+        if glyph_id == 0 {
+            return Ok(None);
+        }
+        let Some(image) = Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .render(&mut scaler, glyph_id)
+        else {
+            return Ok(None);
+        };
+        let width = image.placement.width.max(1);
+        let height = image.placement.height.max(1);
+        let top = image.placement.top;
+        let left = image.placement.left;
+        let is_mask = matches!(image.content, SwashContent::Mask);
+        top_max = top_max.max(top);
+        bottom_max = bottom_max.max(height as i32 - top);
+        let advance = metrics.advance_width(glyph_id).max(px_size * 0.5);
+        advance_total += advance;
+        glyphs.push(GlyphBitmap {
+            data: image.data,
+            is_mask,
+            width,
+            height,
+            left,
+            top,
+            advance,
+        });
+    }
+
+    if glyphs.is_empty() {
+        return Ok(None);
+    }
+
+    let pad = (px_size * 0.35).ceil() as u32;
+    let baseline = top_max.max(0) as u32 + pad;
+    let canvas_height = (top_max.max(0) + bottom_max.max(0)) as u32 + pad * 2;
+    let canvas_width = advance_total.ceil() as u32 + pad * 2 + (px_size * 0.8).ceil() as u32;
+    let mut canvas = image::RgbImage::from_pixel(
+        canvas_width.max(1),
+        canvas_height.max(1),
+        image::Rgb([255, 255, 255]),
+    );
+    let fill_rgb = fill_rgb(fill);
+    let fake_bold = style.bold && !face.has_custom_bold;
+    let bold_offsets: &[u32] = if fake_bold { &[0, 1, 2] } else { &[0] };
+    let mut pen_x = pad as f32;
+
+    for glyph in &glyphs {
+        let base_x = pen_x.round() as i32 + glyph.left;
+        let base_y = baseline as i32 - glyph.top;
+        for dx in bold_offsets {
+            blend_glyph_bitmap(&mut canvas, glyph, base_x + *dx as i32, base_y, fill_rgb);
+        }
+        pen_x += glyph.advance;
+    }
+
+    let slanted = shear_text_image(&canvas, 0.22);
+    let (trimmed, trim_top) = trim_white_text_image(&slanted, 2);
+    let width_pt = trimmed.width() as f64 / pixels_per_pt as f64;
+    let height_pt = trimmed.height() as f64 / pixels_per_pt as f64;
+    let baseline_from_top_pt = (baseline as i32 - trim_top).max(0) as f64 / pixels_per_pt as f64;
+    let baseline_offset_pt = raster_faux_italic_baseline_offset(height_pt, baseline_from_top_pt);
+    let mut jpeg = Vec::new();
+    DynamicImage::ImageRgb8(trimmed)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            ImageOutputFormat::Jpeg(90),
+        )
+        .map_err(|e| format!("斜体テキスト画像の書き出しに失敗しました: {e}"))?;
+
+    Ok(Some(RasterizedFauxItalicText {
+        jpeg_data: jpeg,
+        width_pt,
+        height_pt,
+        baseline_offset_pt,
+    }))
+}
+
+fn fill_rgb(fill: Color) -> [u8; 3] {
+    [
+        (fill.r() * 255.0).round().clamp(0.0, 255.0) as u8,
+        (fill.g() * 255.0).round().clamp(0.0, 255.0) as u8,
+        (fill.b() * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn blend_glyph_bitmap(
+    canvas: &mut image::RgbImage,
+    glyph: &GlyphBitmap,
+    origin_x: i32,
+    origin_y: i32,
+    fill: [u8; 3],
+) {
+    for y in 0..glyph.height {
+        for x in 0..glyph.width {
+            let alpha = if glyph.is_mask {
+                glyph.data[(y * glyph.width + x) as usize]
+            } else {
+                let idx = ((y * glyph.width + x) * 4 + 3) as usize;
+                glyph.data.get(idx).copied().unwrap_or(0)
+            };
+            if alpha == 0 {
+                continue;
+            }
+            let dst_x = origin_x + x as i32;
+            let dst_y = origin_y + y as i32;
+            if dst_x < 0
+                || dst_y < 0
+                || dst_x >= canvas.width() as i32
+                || dst_y >= canvas.height() as i32
+            {
+                continue;
+            }
+            let pixel = canvas.get_pixel_mut(dst_x as u32, dst_y as u32);
+            let a = alpha as f32 / 255.0;
+            for channel in 0..3 {
+                pixel.0[channel] = ((fill[channel] as f32 * a)
+                    + (pixel.0[channel] as f32 * (1.0 - a)))
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+fn shear_text_image(image: &image::RgbImage, shear: f32) -> image::RgbImage {
+    let extra = ((image.height() as f32) * shear).ceil() as u32;
+    let mut out = image::RgbImage::from_pixel(
+        image.width() + extra,
+        image.height(),
+        image::Rgb([255, 255, 255]),
+    );
+    for y in 0..image.height() {
+        let dx = (((image.height() - 1 - y) as f32) * shear).round() as u32;
+        for x in 0..image.width() {
+            out.put_pixel(x + dx, y, *image.get_pixel(x, y));
+        }
+    }
+    out
+}
+
+fn trim_white_text_image(image: &image::RgbImage, pad: u32) -> (image::RgbImage, i32) {
+    let mut min_x = image.width();
+    let mut min_y = image.height();
+    let mut max_x = 0_u32;
+    let mut max_y = 0_u32;
+
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let pixel = image.get_pixel(x, y);
+            if pixel.0.iter().any(|channel| *channel < 248) {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if min_x > max_x || min_y > max_y {
+        return (image.clone(), 0);
+    }
+
+    let crop_x = min_x.saturating_sub(pad);
+    let crop_y = min_y.saturating_sub(pad);
+    let crop_right = (max_x + pad).min(image.width().saturating_sub(1));
+    let crop_bottom = (max_y + pad).min(image.height().saturating_sub(1));
+    let width = crop_right - crop_x + 1;
+    let height = crop_bottom - crop_y + 1;
+    let cropped = image.view(crop_x, crop_y, width, height).to_image();
+    (cropped, crop_y as i32)
+}
+
 fn draw_faux_italic_text(
     page: &mut OxidizePage,
     text: &str,
@@ -2742,39 +3031,65 @@ fn draw_faux_italic_text(
     x: f64,
     y: f64,
     fill: Color,
-    bold: bool,
-) -> Result<(), String> {
+    fake_bold: bool,
+) -> Result<f64, String> {
+    draw_faux_italic_text_fallback(page, text, font.clone(), size, x, y, fill, fake_bold)
+        .map(|draw_width| draw_width.max(approx_width_pt(text, &font, size)))
+}
+
+fn draw_faux_italic_text_fallback(
+    page: &mut OxidizePage,
+    text: &str,
+    font: Font,
+    size: f64,
+    x: f64,
+    y: f64,
+    fill: Color,
+    fake_bold: bool,
+) -> Result<f64, String> {
     let mut cursor_x = x;
-    let mut seen_chars = 0usize;
-    for (idx, ch) in text.chars().enumerate() {
-        let ch_text = ch.to_string();
-        let draw_x = cursor_x + faux_italic_skew(idx, size);
-        if bold {
-            draw_fake_bold_text(page, &ch_text, font.clone(), size, draw_x, y, fill)?;
+    for (idx, grapheme) in UnicodeSegmentation::graphemes(text, true).enumerate() {
+        let draw_x =
+            cursor_x + faux_italic_skew(idx, size) + faux_italic_bold_slant(idx, size, fake_bold);
+        let grapheme_width = approx_width_pt(grapheme, &font, size);
+        if fake_bold {
+            draw_fake_bold_text(page, grapheme, font.clone(), size, draw_x, y, fill)?;
         } else {
             page.text()
                 .set_fill_color(fill)
                 .set_font(font.clone(), size)
                 .at(draw_x, y)
-                .write(&ch_text)
+                .write(grapheme)
                 .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
         }
-        cursor_x += approx_width_pt(&ch_text, &font, size);
-        seen_chars += 1;
+        cursor_x += grapheme_width;
     }
-    if seen_chars == 0 {
-        page.text()
-            .set_fill_color(fill)
-            .set_font(font, size)
-            .at(x, y)
-            .write(text)
-            .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
-    }
-    Ok(())
+    Ok(faux_italic_advance_width(text, &font, size, fake_bold))
 }
 
 fn faux_italic_skew(index: usize, size: f64) -> f64 {
-    (index as f64 * (size * 0.012)).min(size * 0.12)
+    (index as f64 * (size * 0.15)).min(size * 0.60)
+}
+
+fn faux_italic_bold_slant(index: usize, size: f64, fake_bold: bool) -> f64 {
+    if fake_bold {
+        index as f64 * (size * 0.05)
+    } else {
+        0.0
+    }
+}
+
+fn faux_italic_advance_width(text: &str, font: &Font, size: f64, fake_bold: bool) -> f64 {
+    let mut cursor_x = 0.0_f64;
+    let mut max_right = 0.0_f64;
+    for (idx, grapheme) in UnicodeSegmentation::graphemes(text, true).enumerate() {
+        let grapheme_width = approx_width_pt(grapheme, font, size);
+        let draw_x =
+            cursor_x + faux_italic_skew(idx, size) + faux_italic_bold_slant(idx, size, fake_bold);
+        max_right = max_right.max(draw_x + grapheme_width);
+        cursor_x += grapheme_width;
+    }
+    max_right.max(cursor_x)
 }
 
 fn code_block_fits_on_single_page(block_h: f64) -> bool {
@@ -2836,11 +3151,11 @@ fn list_item_content_x(prefix: &str, font: &Font, font_size: f64) -> f64 {
     MARGIN + 4.0 + approx_width_pt(prefix, font, font_size) + 4.0
 }
 
-fn should_fake_italic(style: TextStyle, text: &str) -> bool {
+fn should_fake_italic(_face: &PreviewFace, style: TextStyle, text: &str) -> bool {
     style.italic && !ascii_only(text)
 }
 
-fn should_fake_italic_grapheme(style: TextStyle, grapheme: &str) -> bool {
+fn should_fake_italic_grapheme(_face: &PreviewFace, style: TextStyle, grapheme: &str) -> bool {
     style.italic && !ascii_only(grapheme) && !grapheme_has_emoji(grapheme)
 }
 
@@ -4111,12 +4426,26 @@ mod tests {
         let md = "これは [OpenAI](https://openai.com) と *日本語* の確認です。\n";
         let blocks = parse_markdown_blocks(md);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let face = PreviewFace {
+            body: Font::Helvetica,
+            body_bold: Font::HelveticaBold,
+            body_italic: Font::HelveticaOblique,
+            body_bold_italic: Font::HelveticaBoldOblique,
+            body_path: None,
+            body_bold_path: None,
+            emoji: None,
+            emoji_path: None,
+            has_custom_bold_italic: false,
+            has_custom_bold: false,
+        };
 
         match &blocks[0] {
             MarkdownBlock::Paragraph(spans) => {
                 assert!(spans.iter().any(|s| s.style.link), "{spans:?}");
                 assert!(
-                    spans.iter().any(|s| should_fake_italic(s.style, &s.text)),
+                    spans
+                        .iter()
+                        .any(|s| should_fake_italic(&face, s.style, &s.text)),
                     "{spans:?}"
                 );
             }
@@ -4177,13 +4506,151 @@ mod tests {
     fn emoji_baseline_offset_scales_with_raster_placement() {
         let offset = emoji_baseline_offset_pt(20, 60);
         let expected = ((60 - 20) as f64 / EMOJI_RASTER_PX_PER_PT as f64) * EMOJI_DISPLAY_SCALE;
-        assert!((offset - expected).abs() < f64::EPSILON, "offset={offset}, expected={expected}");
+        assert!(
+            (offset - expected).abs() < f64::EPSILON,
+            "offset={offset}, expected={expected}"
+        );
     }
 
     #[test]
     fn emoji_draw_y_uses_the_rasterized_baseline_offset() {
         let draw_y = emoji_draw_y(100.0, 12.5);
         assert!((draw_y - 87.5).abs() < f64::EPSILON, "draw_y={draw_y}");
+    }
+
+    #[test]
+    fn faux_italic_skew_is_visible() {
+        assert!(
+            faux_italic_skew(1, 11.5) >= 1.0,
+            "skew should be visually noticeable"
+        );
+    }
+
+    #[test]
+    fn faux_italic_advance_width_accounts_for_slant() {
+        let font = Font::Helvetica;
+        let base = approx_width_pt("太字斜体", &font, 11.5);
+        let shifted = faux_italic_advance_width("太字斜体", &font, 11.5, true);
+        assert!(
+            shifted > base,
+            "shifted={shifted}, base={base} should include the faux italic slant"
+        );
+    }
+
+    #[test]
+    fn japanese_italic_uses_body_font_for_faux_slant() {
+        let face = PreviewFace {
+            body: Font::Helvetica,
+            body_bold: Font::HelveticaBold,
+            body_italic: Font::custom("NotoSansJP-Italic"),
+            body_bold_italic: Font::custom("NotoSansJP-BoldItalic"),
+            body_path: Some(PathBuf::from("regular.ttf")),
+            body_bold_path: Some(PathBuf::from("bold.ttf")),
+            emoji: None,
+            emoji_path: None,
+            has_custom_bold_italic: true,
+            has_custom_bold: true,
+        };
+
+        let italic_font = face.pick(
+            TextStyle {
+                italic: true,
+                ..TextStyle::default()
+            },
+            "日本語",
+        );
+        let bold_italic_font = face.pick(
+            TextStyle {
+                italic: true,
+                bold: true,
+                ..TextStyle::default()
+            },
+            "日本語",
+        );
+
+        assert_eq!(italic_font, Font::Helvetica);
+        assert_eq!(bold_italic_font, Font::HelveticaBold);
+    }
+
+    #[test]
+    fn japanese_inline_emphasis_sample_marks_all_three_styles() {
+        let md = "通常文の中に **太字**、*斜体*、***太字斜体*** を含めます。\n";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+
+        match &blocks[0] {
+            MarkdownBlock::Paragraph(spans) => {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.text == "太字" && s.style.bold && !s.style.italic),
+                    "{spans:?}"
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.text == "斜体" && !s.style.bold && s.style.italic),
+                    "{spans:?}"
+                );
+                assert!(
+                    spans
+                        .iter()
+                        .any(|s| s.text == "太字斜体" && s.style.bold && s.style.italic),
+                    "{spans:?}"
+                );
+                assert!(plain_text(spans).contains("を含めます。"), "{spans:?}");
+            }
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn japanese_non_emoji_italic_requests_full_span_raster_slant() {
+        let face = PreviewFace {
+            body: Font::Helvetica,
+            body_bold: Font::HelveticaBold,
+            body_italic: Font::custom("NotoSansJP-Italic"),
+            body_bold_italic: Font::custom("NotoSansJP-BoldItalic"),
+            body_path: Some(PathBuf::from("regular.ttf")),
+            body_bold_path: Some(PathBuf::from("bold.ttf")),
+            emoji: None,
+            emoji_path: None,
+            has_custom_bold_italic: true,
+            has_custom_bold: true,
+        };
+        let italic = TextStyle {
+            italic: true,
+            ..TextStyle::default()
+        };
+        let bold_italic = TextStyle {
+            bold: true,
+            italic: true,
+            ..TextStyle::default()
+        };
+
+        assert!(should_raster_faux_italic(&face, italic, "斜体"));
+        assert!(should_raster_faux_italic(&face, bold_italic, "太字斜体"));
+        assert!(!should_raster_faux_italic(&face, italic, "ABC"));
+        assert!(!should_raster_faux_italic(&face, italic, "斜体😀"));
+    }
+
+    #[test]
+    fn raster_faux_italic_advance_uses_drawn_image_width() {
+        let rendered = RasterizedFauxItalicText {
+            jpeg_data: Vec::new(),
+            width_pt: 42.5,
+            height_pt: 12.0,
+            baseline_offset_pt: 9.0,
+        };
+
+        assert_eq!(raster_faux_italic_advance_width(&rendered), 42.5);
+    }
+
+    #[test]
+    fn raster_faux_italic_baseline_offset_is_measured_from_bottom() {
+        let offset = raster_faux_italic_baseline_offset(12.0, 8.0);
+
+        assert_eq!(offset, 4.0);
     }
 
     #[test]
@@ -4194,15 +4661,60 @@ mod tests {
         };
 
         assert!(
-            should_fake_italic_grapheme(style, "日本語"),
+            should_fake_italic_grapheme(
+                &PreviewFace {
+                    body: Font::Helvetica,
+                    body_bold: Font::HelveticaBold,
+                    body_italic: Font::HelveticaOblique,
+                    body_bold_italic: Font::HelveticaBoldOblique,
+                    body_path: None,
+                    body_bold_path: None,
+                    emoji: None,
+                    emoji_path: None,
+                    has_custom_bold_italic: false,
+                    has_custom_bold: false,
+                },
+                style,
+                "日本語"
+            ),
             "Japanese graphemes in a mixed emoji span should still be slanted"
         );
         assert!(
-            !should_fake_italic_grapheme(style, "😀"),
+            !should_fake_italic_grapheme(
+                &PreviewFace {
+                    body: Font::Helvetica,
+                    body_bold: Font::HelveticaBold,
+                    body_italic: Font::HelveticaOblique,
+                    body_bold_italic: Font::HelveticaBoldOblique,
+                    body_path: None,
+                    body_bold_path: None,
+                    emoji: None,
+                    emoji_path: None,
+                    has_custom_bold_italic: false,
+                    has_custom_bold: false,
+                },
+                style,
+                "😀"
+            ),
             "emoji graphemes should be rasterized instead of slanted"
         );
         assert!(
-            !should_fake_italic_grapheme(style, "ABC"),
+            !should_fake_italic_grapheme(
+                &PreviewFace {
+                    body: Font::Helvetica,
+                    body_bold: Font::HelveticaBold,
+                    body_italic: Font::HelveticaOblique,
+                    body_bold_italic: Font::HelveticaBoldOblique,
+                    body_path: None,
+                    body_bold_path: None,
+                    emoji: None,
+                    emoji_path: None,
+                    has_custom_bold_italic: false,
+                    has_custom_bold: false,
+                },
+                style,
+                "ABC"
+            ),
             "ASCII text should keep the normal italic font path"
         );
     }
@@ -4314,21 +4826,21 @@ mod tests {
         );
 
         let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
-        let pdf_text = String::from_utf8_lossy(&bytes);
-        assert!(
-            pdf_text.contains("/DCTDecode"),
-            "expected JPEG-encoded math image in PDF"
-        );
-        assert!(
-            !pdf_text.contains("\\["),
-            "expected display math delimiters to be stripped from the PDF"
-        );
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("bracket-display-math.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
         let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
             .await
             .expect("generated preview PDF should be readable");
+        let loaded_text = loaded
+            .pages
+            .iter()
+            .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
+            .collect::<String>();
+        assert!(
+            !loaded_text.contains("\\["),
+            "expected display math delimiters to be stripped from extracted page text"
+        );
         assert!(
             loaded.pages.iter().any(|page| !page.images.is_empty()),
             "expected rendered bracket math to appear as an embedded image"
@@ -4376,8 +4888,11 @@ mod tests {
             body_bold: Font::HelveticaBold,
             body_italic: Font::HelveticaOblique,
             body_bold_italic: Font::HelveticaBoldOblique,
+            body_path: None,
+            body_bold_path: None,
             emoji: None,
             emoji_path: None,
+            has_custom_bold_italic: false,
             has_custom_bold: false,
         };
         let short = vec![BlockquoteLine::Text(vec![InlineSpan {
