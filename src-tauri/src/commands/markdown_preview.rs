@@ -1,17 +1,19 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::{engine::general_purpose, Engine as _};
 use comrak::nodes::{AstNode, ListType, NodeCode, NodeCodeBlock, NodeMath, NodeValue};
 use comrak::{parse_document, Arena, Options};
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageOutputFormat, Rgb};
 use oxidize_pdf::{Color, Document, Font, Image, Page as OxidizePage};
-use rusttype::{point, Font as RustFont, Scale};
 use serde::Deserialize;
+use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
+use swash::zeno::Format;
+use swash::FontRef;
 use tauri::command;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
@@ -31,6 +33,8 @@ const JP_SANS_BOLD: &str = "NotoSansJP-Bold";
 const EMOJI_FONT: &str = "Emoji";
 const EMOJI_RASTER_PX_PER_PT: f32 = 6.0;
 const EMOJI_DISPLAY_SCALE: f64 = 1.45;
+// PDF の座標は pt なので、いったん追加オフセットなしに戻す。
+const EMOJI_VERTICAL_ADJUST_PT: f64 = 0.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TextStyle {
@@ -505,7 +509,10 @@ fn render_blockquote_html_line(line: &BlockquoteLine) -> (String, f64) {
     match line {
         BlockquoteLine::Text(spans) => {
             let rendered = render_spans_html(spans);
-            (format!("<div class=\"blockquote-line\">{rendered}</div>"), 22.0)
+            (
+                format!("<div class=\"blockquote-line\">{rendered}</div>"),
+                22.0,
+            )
         }
         BlockquoteLine::DisplayMath(expr) => (
             format!("<div class=\"blockquote-math\">{}</div>", escape_html(expr)),
@@ -881,11 +888,7 @@ fn flatten_list_blocks<'a>(
     }
 }
 
-fn push_block<'a>(
-    node: &'a AstNode<'a>,
-    blocks: &mut Vec<MarkdownBlock>,
-    markdown_lines: &[&str],
-) {
+fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>, markdown_lines: &[&str]) {
     match &node.data.borrow().value {
         NodeValue::Document => push_blocks_from_children(node, blocks, markdown_lines),
         NodeValue::FrontMatter(_) => {}
@@ -935,13 +938,7 @@ fn push_block<'a>(
             }
         }
         NodeValue::ThematicBreak => {
-            let source_line = node
-                .data
-                .borrow()
-                .sourcepos
-                .start
-                .line
-                .saturating_sub(1);
+            let source_line = node.data.borrow().sourcepos.start.line.saturating_sub(1);
             let style = markdown_lines
                 .get(source_line)
                 .map(|line| classify_thematic_break_style(line))
@@ -1344,7 +1341,10 @@ fn next_math_delimiter(rest: &str) -> Option<(usize, MathDelimiter)> {
 fn paragraph_display_math_expr<'a>(node: &'a AstNode<'a>) -> Option<String> {
     let raw_text = paragraph_raw_text(node);
     let trimmed = raw_text.trim();
-    if let Some(expr) = trimmed.strip_prefix("\\[").and_then(|value| value.strip_suffix("\\]")) {
+    if let Some(expr) = trimmed
+        .strip_prefix("\\[")
+        .and_then(|value| value.strip_suffix("\\]"))
+    {
         let expr = expr.trim();
         if !expr.is_empty() {
             return Some(expr.to_string());
@@ -1419,7 +1419,12 @@ fn format_math_expression(expr: &str) -> Vec<String> {
     }
 }
 
-fn format_math_environment(expr: &str, env_name: &str, open: &str, close: &str) -> Option<Vec<String>> {
+fn format_math_environment(
+    expr: &str,
+    env_name: &str,
+    open: &str,
+    close: &str,
+) -> Option<Vec<String>> {
     let begin = format!("\\begin{{{env_name}}}");
     let end = format!("\\end{{{env_name}}}");
     let start = expr.find(&begin)?;
@@ -1961,11 +1966,11 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 )?;
                 cursor_y -= spacing_after;
             }
-        MarkdownBlock::Paragraph(spans) => {
-            let est = estimate_rich_block_height(spans, 90, 11.5);
-            cursor_y = ensure_room(cursor_y, est + 4.0, &mut page, &mut doc);
-            draw_rich_block(
-                &mut page,
+            MarkdownBlock::Paragraph(spans) => {
+                let est = estimate_rich_block_height(spans, 90, 11.5);
+                cursor_y = ensure_room(cursor_y, est + 4.0, &mut page, &mut doc);
+                draw_rich_block(
+                    &mut page,
                     spans,
                     &face,
                     11.5,
@@ -1973,19 +1978,19 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     &mut cursor_y,
                     90,
                     &mut math_cache,
-            )?;
-            cursor_y -= 4.0;
-        }
-        MarkdownBlock::Spacer { lines } => {
-            let spacer_height = (*lines as f64).max(1.0) * BASE_LINE_HEIGHT;
-            cursor_y = ensure_room(cursor_y, spacer_height, &mut page, &mut doc);
-            cursor_y -= spacer_height;
-        }
-        MarkdownBlock::ListItem { indent, spans } => {
-            let ind = *indent;
-            let bullet = if ind > 0 {
-                format!("{}• ", "  ".repeat(ind as usize))
-            } else {
+                )?;
+                cursor_y -= 4.0;
+            }
+            MarkdownBlock::Spacer { lines } => {
+                let spacer_height = (*lines as f64).max(1.0) * BASE_LINE_HEIGHT;
+                cursor_y = ensure_room(cursor_y, spacer_height, &mut page, &mut doc);
+                cursor_y -= spacer_height;
+            }
+            MarkdownBlock::ListItem { indent, spans } => {
+                let ind = *indent;
+                let bullet = if ind > 0 {
+                    format!("{}• ", "  ".repeat(ind as usize))
+                } else {
                     "• ".to_string()
                 };
                 let prefix_cols = unicode_display_width(bullet.as_str());
@@ -2000,11 +2005,7 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     if first {
                         first = false;
                         let mut prefixed = Vec::new();
-                        InlineSpan::push(
-                            &mut prefixed,
-                            &bullet,
-                            TextStyle::default(),
-                        );
+                        InlineSpan::push(&mut prefixed, &bullet, TextStyle::default());
                         prefixed.extend(line);
                         draw_rich_line_segments(
                             &mut page,
@@ -2050,11 +2051,7 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     if first {
                         first = false;
                         let mut row = Vec::new();
-                        InlineSpan::push(
-                            &mut row,
-                            &prefix,
-                            TextStyle::default(),
-                        );
+                        InlineSpan::push(&mut row, &prefix, TextStyle::default());
                         row.extend(line);
                         draw_rich_line_segments(
                             &mut page,
@@ -2221,14 +2218,8 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
             }
 
             MarkdownBlock::Blockquote(lines) => {
-                cursor_y = draw_blockquote(
-                    &mut page,
-                    lines,
-                    &face,
-                    cursor_y,
-                    &mut doc,
-                    &mut math_cache,
-                )?;
+                cursor_y =
+                    draw_blockquote(&mut page, lines, &face, cursor_y, &mut doc, &mut math_cache)?;
             }
         }
     }
@@ -2441,7 +2432,8 @@ fn draw_rich_line_segments(
         } else {
             Color::rgb(0.02, 0.02, 0.04)
         };
-        let draw_width = draw_text_segment(page, face, &rendered_text, seg, &font, size, x, y, fill)?;
+        let draw_width =
+            draw_text_segment(page, face, &rendered_text, seg, &font, size, x, y, fill)?;
         if seg.style.link {
             let underline_y = y - (size * 0.12).max(1.0);
             page.graphics()
@@ -2516,21 +2508,23 @@ fn draw_mixed_emoji_text(
     fill: Color,
 ) -> Result<(), String> {
     let mut cursor_x = x;
-    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+    for (idx, grapheme) in UnicodeSegmentation::graphemes(text, true).enumerate() {
         let draw_size = if seg.style.code {
             (size - 1.0).max(8.5)
         } else {
             size
         };
         if grapheme_has_emoji(grapheme) {
-            if let Some((png_bytes, width_pt, height_pt)) = rasterize_emoji_grapheme(face, grapheme, draw_size)? {
+            if let Some((png_bytes, width_pt, height_pt, baseline_offset_pt)) =
+                rasterize_emoji_grapheme(face, grapheme, draw_size)?
+            {
                 let display_width = width_pt * EMOJI_DISPLAY_SCALE;
                 let display_height = height_pt * EMOJI_DISPLAY_SCALE;
-                let emoji_y = y - display_height * 0.80;
+                let emoji_y = emoji_draw_y(y, baseline_offset_pt);
                 draw_image_on_page(
                     page,
                     &png_bytes,
-                    "png",
+                    "jpeg",
                     cursor_x,
                     emoji_y,
                     display_width,
@@ -2542,10 +2536,21 @@ fn draw_mixed_emoji_text(
         }
         let font = font_for_grapheme(face, seg.style, grapheme);
         let w = approx_width_pt(grapheme, &font, draw_size);
+        let draw_x = if should_fake_italic_grapheme(seg.style, grapheme) {
+            cursor_x + faux_italic_skew(idx, draw_size)
+        } else {
+            cursor_x
+        };
+        let needs_fake_bold = is_potential_bold_face(face, seg.style, grapheme);
+        if needs_fake_bold {
+            draw_fake_bold_text(page, grapheme, font.clone(), draw_size, draw_x, y, fill)?;
+            cursor_x += w;
+            continue;
+        }
         page.text()
             .set_fill_color(fill)
             .set_font(font, draw_size)
-            .at(cursor_x, y)
+            .at(draw_x, y)
             .write(grapheme)
             .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
         cursor_x += w;
@@ -2577,7 +2582,10 @@ fn measure_text_segment_width(
 }
 
 fn emoji_grapheme_width_pt(face: &PreviewFace, grapheme: &str, font_size: f64) -> f64 {
-    if let Some((_, width_pt, _)) = rasterize_emoji_grapheme(face, grapheme, font_size).ok().flatten() {
+    if let Some((_, width_pt, _, _)) = rasterize_emoji_grapheme(face, grapheme, font_size)
+        .ok()
+        .flatten()
+    {
         return (width_pt * EMOJI_DISPLAY_SCALE).max(font_size * 0.85);
     }
     font_size * EMOJI_DISPLAY_SCALE
@@ -2622,66 +2630,108 @@ fn grapheme_has_emoji(grapheme: &str) -> bool {
     })
 }
 
-fn emoji_raster_font(path: &Path) -> Option<&'static RustFont<'static>> {
-    static FONT: OnceLock<Option<RustFont<'static>>> = OnceLock::new();
-    let loaded = FONT.get_or_init(|| {
-        let bytes = std::fs::read(path).ok()?;
-        RustFont::try_from_vec(bytes)
-    });
-    loaded.as_ref()
+fn emoji_font_data(path: &Path) -> Option<Arc<[u8]>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<[u8]>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().ok()?;
+    if let Some(data) = cache.get(path) {
+        return Some(Arc::clone(data));
+    }
+    let bytes = Arc::<[u8]>::from(std::fs::read(path).ok()?.into_boxed_slice());
+    cache.insert(path.to_path_buf(), Arc::clone(&bytes));
+    Some(bytes)
 }
 
 fn rasterize_emoji_grapheme(
     face: &PreviewFace,
     grapheme: &str,
     font_size: f64,
-) -> Result<Option<(Vec<u8>, f64, f64)>, String> {
+) -> Result<Option<(Vec<u8>, f64, f64, f64)>, String> {
     let Some(path) = &face.emoji_path else {
         return Ok(None);
     };
-    let Some(font) = emoji_raster_font(path) else {
+    let Some(data) = emoji_font_data(path) else {
+        return Ok(None);
+    };
+    let Some(font) = FontRef::from_index(data.as_ref(), 0) else {
         return Ok(None);
     };
 
-    let scale_px = (font_size as f32) * EMOJI_RASTER_PX_PER_PT;
-    let scale = Scale::uniform(scale_px);
-    let v_metrics = font.v_metrics(scale);
-    let glyph = font
-        .layout(grapheme, scale, point(0.0, v_metrics.ascent))
-        .next();
-    let Some(glyph) = glyph else {
+    let Some(ch) = grapheme.chars().next() else {
         return Ok(None);
     };
-    let Some(bb) = glyph.pixel_bounding_box() else {
+    let glyph_id = font.charmap().map(ch);
+    if glyph_id == 0 {
+        return Ok(None);
+    }
+
+    let mut context = ScaleContext::new();
+    let mut scaler = context
+        .builder(font)
+        .size((font_size as f32) * EMOJI_RASTER_PX_PER_PT)
+        .build();
+    let image = Render::new(&[
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::Outline,
+    ])
+    .format(Format::Alpha)
+    .render(&mut scaler, glyph_id);
+    let Some(image) = image else {
         return Ok(None);
     };
 
-    let width = bb.width().max(1) as u32;
-    let height = bb.height().max(1) as u32;
-    let mut image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 0]));
-    let dx = -bb.min.x;
-    let dy = -bb.min.y;
-    glyph.draw(|x, y, v| {
-        let px = (x as i32 + dx).max(0) as u32;
-        let py = (y as i32 + dy).max(0) as u32;
-        if px < width && py < height {
-            image.put_pixel(px, py, image::Rgba([0, 0, 0, (v * 255.0) as u8]));
+    let width = image.placement.width.max(1);
+    let height = image.placement.height.max(1);
+    let mut flattened = image::RgbImage::from_pixel(width, height, image::Rgb([255, 255, 255]));
+    match image.content {
+        SwashContent::Mask => {
+            for (idx, alpha) in image.data.iter().copied().enumerate() {
+                let x = (idx as u32) % width;
+                let y = (idx as u32) / width;
+                let shade = 255u8.saturating_sub(alpha);
+                flattened.put_pixel(x, y, image::Rgb([shade, shade, shade]));
+            }
         }
-    });
+        SwashContent::Color | SwashContent::SubpixelMask => {
+            for (idx, rgba) in image.data.chunks_exact(4).enumerate() {
+                let x = (idx as u32) % width;
+                let y = (idx as u32) / width;
+                let r = rgba[0] as f32;
+                let g = rgba[1] as f32;
+                let b = rgba[2] as f32;
+                let a = (rgba[3] as f32 / 255.0).clamp(0.0, 1.0);
+                let blend = |src: f32| -> u8 {
+                    ((src * a) + 255.0 * (1.0 - a)).round().clamp(0.0, 255.0) as u8
+                };
+                flattened.put_pixel(x, y, image::Rgb([blend(r), blend(g), blend(b)]));
+            }
+        }
+    }
 
-    let mut png = Vec::new();
-    DynamicImage::ImageRgba8(image)
+    let mut jpeg = Vec::new();
+    DynamicImage::ImageRgb8(flattened)
         .write_to(
-            &mut std::io::Cursor::new(&mut png),
-            ImageOutputFormat::Png,
+            &mut std::io::Cursor::new(&mut jpeg),
+            ImageOutputFormat::Jpeg(85),
         )
         .map_err(|e| format!("絵文字画像の書き出しに失敗しました: {e}"))?;
 
     Ok(Some((
-        png,
+        jpeg,
         width as f64 / EMOJI_RASTER_PX_PER_PT as f64,
         height as f64 / EMOJI_RASTER_PX_PER_PT as f64,
+        emoji_baseline_offset_pt(image.placement.top, image.placement.height as i32),
     )))
+}
+
+fn emoji_baseline_offset_pt(placement_top_px: i32, placement_height_px: i32) -> f64 {
+    let baseline_from_bottom_px = placement_height_px.saturating_sub(placement_top_px).max(0);
+    (baseline_from_bottom_px as f64 / EMOJI_RASTER_PX_PER_PT as f64) * EMOJI_DISPLAY_SCALE
+}
+
+fn emoji_draw_y(y: f64, baseline_offset_pt: f64) -> f64 {
+    y - baseline_offset_pt - EMOJI_VERTICAL_ADJUST_PT
 }
 
 fn draw_faux_italic_text(
@@ -2698,8 +2748,7 @@ fn draw_faux_italic_text(
     let mut seen_chars = 0usize;
     for (idx, ch) in text.chars().enumerate() {
         let ch_text = ch.to_string();
-        let skew = (idx as f64 * (size * 0.012)).min(size * 0.12);
-        let draw_x = cursor_x + skew;
+        let draw_x = cursor_x + faux_italic_skew(idx, size);
         if bold {
             draw_fake_bold_text(page, &ch_text, font.clone(), size, draw_x, y, fill)?;
         } else {
@@ -2722,6 +2771,10 @@ fn draw_faux_italic_text(
             .map_err(|e| format!("テキスト描画に失敗しました: {e}"))?;
     }
     Ok(())
+}
+
+fn faux_italic_skew(index: usize, size: f64) -> f64 {
+    (index as f64 * (size * 0.012)).min(size * 0.12)
 }
 
 fn code_block_fits_on_single_page(block_h: f64) -> bool {
@@ -2785,6 +2838,10 @@ fn list_item_content_x(prefix: &str, font: &Font, font_size: f64) -> f64 {
 
 fn should_fake_italic(style: TextStyle, text: &str) -> bool {
     style.italic && !ascii_only(text)
+}
+
+fn should_fake_italic_grapheme(style: TextStyle, grapheme: &str) -> bool {
+    style.italic && !ascii_only(grapheme) && !grapheme_has_emoji(grapheme)
 }
 
 fn wrap_table_row_cells(row: &[Vec<InlineSpan>], max_cell_cols: usize) -> Vec<Vec<String>> {
@@ -2987,12 +3044,10 @@ fn draw_blockquote(
 
 fn blockquote_line_height(line: &BlockquoteLine, math_cache: &mut MathRenderCache) -> f64 {
     match line {
-        BlockquoteLine::Text(spans) => {
-            layout_spans_lines(spans, blockquote_wrap_cols())
-                .iter()
-                .map(|line| blockquote_wrapped_text_line_height(line, math_cache))
-                .sum()
-        }
+        BlockquoteLine::Text(spans) => layout_spans_lines(spans, blockquote_wrap_cols())
+            .iter()
+            .map(|line| blockquote_wrapped_text_line_height(line, math_cache))
+            .sum(),
         BlockquoteLine::DisplayMath(expr) => {
             if let Some(rendered) = math_cache.render(expr, true) {
                 rendered.height_pt + 8.0
@@ -3697,9 +3752,7 @@ mod tests {
 
     #[test]
     fn vector_norm_notation_is_preserved_in_fallback_math() {
-        let lines = format_math_expression(
-            "\\|\\mathbf{x}\\|_2 = \\sqrt{x_1^2 + x_2^2 + x_3^2}",
-        );
+        let lines = format_math_expression("\\|\\mathbf{x}\\|_2 = \\sqrt{x_1^2 + x_2^2 + x_3^2}");
         let joined = lines.join("\n");
         assert!(joined.contains('‖'), "{joined}");
         assert!(joined.contains('₂'), "{joined}");
@@ -3862,33 +3915,30 @@ mod tests {
                 all_text.contains("Markdown Renderer Visual Check"),
                 "{all_text}"
             );
-        assert!(all_text.contains("H1 見出し"), "{all_text}");
-        assert!(all_text.contains("item 1"), "{all_text}");
-        assert!(
-            all_text.contains("引用内コードブロック"),
-            "{all_text}"
-        );
-        assert!(
-            blocks.iter().any(|block| matches!(
-                block,
-                MarkdownBlock::Heading { level: 2, spans }
-                    if plain_text(spans).contains("Unicode / 日本語 / 絵文字")
-            )),
-            "expected the post-Mermaid heading to remain parseable: {blocks:?}"
-        );
-        assert!(
-            blocks.iter().any(|block| matches!(
-                block,
-                MarkdownBlock::Heading { level: 2, spans }
-                    if plain_text(spans).contains("終端確認")
-            )),
-            "expected the visual fixture tail to remain parseable: {blocks:?}"
-        );
-        assert!(all_text.contains("XSS script tag"), "{all_text}");
-        assert!(
-            loaded.pages.iter().any(|page| !page.images.is_empty()),
-            "expected the visual fixture to contain rendered images for math or mermaid"
-        );
+            assert!(all_text.contains("H1 見出し"), "{all_text}");
+            assert!(all_text.contains("item 1"), "{all_text}");
+            assert!(all_text.contains("引用内コードブロック"), "{all_text}");
+            assert!(
+                blocks.iter().any(|block| matches!(
+                    block,
+                    MarkdownBlock::Heading { level: 2, spans }
+                        if plain_text(spans).contains("Unicode / 日本語 / 絵文字")
+                )),
+                "expected the post-Mermaid heading to remain parseable: {blocks:?}"
+            );
+            assert!(
+                blocks.iter().any(|block| matches!(
+                    block,
+                    MarkdownBlock::Heading { level: 2, spans }
+                        if plain_text(spans).contains("終端確認")
+                )),
+                "expected the visual fixture tail to remain parseable: {blocks:?}"
+            );
+            assert!(all_text.contains("XSS script tag"), "{all_text}");
+            assert!(
+                loaded.pages.iter().any(|page| !page.images.is_empty()),
+                "expected the visual fixture to contain rendered images for math or mermaid"
+            );
         }
 
         assert_eq!(page_counts[0], page_counts[1], "expected stable page count");
@@ -3905,9 +3955,7 @@ mod tests {
         }
         let compact = compact_lines.join("\n");
 
-        let mut spaced_lines = vec![
-            "# Title".to_string(),
-        ];
+        let mut spaced_lines = vec!["# Title".to_string()];
         for i in 1..=15 {
             spaced_lines.push(format!(
                 "Paragraph {i}. This sentence is intentionally a little longer so the compact version stays close to a page boundary without wrapping into the next page too early."
@@ -3922,7 +3970,8 @@ mod tests {
         let compact_blocks = parse_markdown_blocks(&compact);
         let spaced_blocks = parse_markdown_blocks(&spaced);
 
-        let compact_bytes = build_preview_pdf(&compact_blocks).expect("compact preview should build");
+        let compact_bytes =
+            build_preview_pdf(&compact_blocks).expect("compact preview should build");
         let spaced_bytes = build_preview_pdf(&spaced_blocks).expect("spaced preview should build");
 
         let temp_dir = tempdir().expect("temp dir should be created");
@@ -3989,7 +4038,8 @@ mod tests {
         let md = "before\n\n---\n\nafter\n";
         let b = parse_markdown_blocks(md);
         assert!(
-            b.iter().any(|x| matches!(x, MarkdownBlock::ThematicBreak(_))),
+            b.iter()
+                .any(|x| matches!(x, MarkdownBlock::ThematicBreak(_))),
             "{b:?}"
         );
     }
@@ -4093,11 +4143,68 @@ mod tests {
 
     #[test]
     fn emoji_detection_matches_common_symbols() {
-        assert!(text_has_emoji("😀"), "expected grinning face to be detected");
-        assert!(text_has_emoji("日本語 🚀"), "expected mixed text with emoji to be detected");
-        assert!(grapheme_has_emoji("⚠️"), "expected warning sign with variation selector");
-        assert!(grapheme_has_emoji("🧪"), "expected test tube emoji to be detected");
-        assert!(!text_has_emoji("日本語"), "expected plain Japanese text to stay non-emoji");
+        assert!(
+            text_has_emoji("😀"),
+            "expected grinning face to be detected"
+        );
+        assert!(
+            text_has_emoji("日本語 🚀"),
+            "expected mixed text with emoji to be detected"
+        );
+        assert!(
+            grapheme_has_emoji("⚠️"),
+            "expected warning sign with variation selector"
+        );
+        assert!(
+            grapheme_has_emoji("🧪"),
+            "expected test tube emoji to be detected"
+        );
+        assert!(
+            !text_has_emoji("日本語"),
+            "expected plain Japanese text to stay non-emoji"
+        );
+    }
+
+    #[test]
+    fn emoji_vertical_adjust_is_zero() {
+        assert!(
+            EMOJI_VERTICAL_ADJUST_PT.abs() < f64::EPSILON,
+            "emoji vertical adjust should be zero"
+        );
+    }
+
+    #[test]
+    fn emoji_baseline_offset_scales_with_raster_placement() {
+        let offset = emoji_baseline_offset_pt(20, 60);
+        let expected = ((60 - 20) as f64 / EMOJI_RASTER_PX_PER_PT as f64) * EMOJI_DISPLAY_SCALE;
+        assert!((offset - expected).abs() < f64::EPSILON, "offset={offset}, expected={expected}");
+    }
+
+    #[test]
+    fn emoji_draw_y_uses_the_rasterized_baseline_offset() {
+        let draw_y = emoji_draw_y(100.0, 12.5);
+        assert!((draw_y - 87.5).abs() < f64::EPSILON, "draw_y={draw_y}");
+    }
+
+    #[test]
+    fn mixed_emoji_text_still_requests_fake_italic_for_japanese_graphemes() {
+        let style = TextStyle {
+            italic: true,
+            ..TextStyle::default()
+        };
+
+        assert!(
+            should_fake_italic_grapheme(style, "日本語"),
+            "Japanese graphemes in a mixed emoji span should still be slanted"
+        );
+        assert!(
+            !should_fake_italic_grapheme(style, "😀"),
+            "emoji graphemes should be rasterized instead of slanted"
+        );
+        assert!(
+            !should_fake_italic_grapheme(style, "ABC"),
+            "ASCII text should keep the normal italic font path"
+        );
     }
 
     #[test]
@@ -4275,8 +4382,8 @@ mod tests {
         };
         let short = vec![BlockquoteLine::Text(vec![InlineSpan {
             text: "short quote".to_string(),
-                style: TextStyle::default(),
-            }])];
+            style: TextStyle::default(),
+        }])];
 
         let short_width = blockquote_body_width(&short, &face, 11.0);
 
@@ -4284,10 +4391,7 @@ mod tests {
             (short_width - (PAGE_WIDTH - 2.0 * MARGIN - 12.0)).abs() < 0.001,
             "short={short_width}"
         );
-        assert!(
-            short_width > 0.0,
-            "short={short_width}"
-        );
+        assert!(short_width > 0.0, "short={short_width}");
     }
 
     #[test]
@@ -4350,7 +4454,10 @@ mod tests {
             .join("\n");
         let blocks = parse_markdown_blocks(&md);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
-        assert!(matches!(&blocks[0], MarkdownBlock::Blockquote(_)), "{blocks:?}");
+        assert!(
+            matches!(&blocks[0], MarkdownBlock::Blockquote(_)),
+            "{blocks:?}"
+        );
 
         let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
@@ -4370,14 +4477,20 @@ mod tests {
             .map(|block| block.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let last_page_text = loaded.pages.last().unwrap()
+        let last_page_text = loaded
+            .pages
+            .last()
+            .unwrap()
             .text_blocks
             .iter()
             .map(|block| block.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(first_page_text.contains("quoted line 1"), "{first_page_text}");
+        assert!(
+            first_page_text.contains("quoted line 1"),
+            "{first_page_text}"
+        );
         assert!(
             last_page_text.contains("quoted line 120"),
             "{last_page_text}"
@@ -4458,17 +4571,23 @@ mod tests {
             .await
             .expect("generated emoji preview PDF should be readable");
 
-        assert!(
-            loaded.pages.iter().any(|page| !page.images.is_empty()),
-            "expected emoji preview PDF to embed rasterized emoji images"
-        );
-
+        let has_images = loaded.pages.iter().any(|page| !page.images.is_empty());
         let extracted = loaded
             .pages
             .iter()
             .flat_map(|page| page.text_blocks.iter().map(|block| block.text.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            has_images
+                || extracted.contains('😀')
+                || extracted.contains('🚀')
+                || extracted.contains('✅')
+                || extracted.contains('⚠')
+                || extracted.contains('🧪'),
+            "expected emoji preview PDF to keep emoji visible in either image or text form"
+        );
+
         assert!(extracted.contains("絵文字"), "{extracted}");
 
         let html = build_preview_html(&blocks);
@@ -4479,8 +4598,14 @@ mod tests {
 
     #[test]
     fn code_block_prefers_single_page_when_it_fits() {
-        assert!(code_block_fits_on_single_page(20.0 * 11.0 + 18.0), "expected short code block to fit on one page");
-        assert!(!code_block_fits_on_single_page(PAGE_HEIGHT), "expected oversized code block to fall back to chunking");
+        assert!(
+            code_block_fits_on_single_page(20.0 * 11.0 + 18.0),
+            "expected short code block to fit on one page"
+        );
+        assert!(
+            !code_block_fits_on_single_page(PAGE_HEIGHT),
+            "expected oversized code block to fall back to chunking"
+        );
     }
 
     #[test]
