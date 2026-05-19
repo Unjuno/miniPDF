@@ -746,7 +746,10 @@ async fn test_markdown_preview_npm_script_smoke() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(all_text.contains("Markdown Renderer Visual Check"), "{all_text}");
+    assert!(
+        all_text.contains("Markdown Renderer Visual Check"),
+        "{all_text}"
+    );
     assert!(all_text.contains("終端確認"), "{all_text}");
 }
 

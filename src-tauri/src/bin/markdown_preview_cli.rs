@@ -40,9 +40,7 @@ where
         match arg.to_string_lossy().as_ref() {
             "-h" | "--help" => return Err(usage()),
             "-o" | "--output" => {
-                let next = args
-                    .next()
-                    .ok_or_else(usage)?;
+                let next = args.next().ok_or_else(usage)?;
                 output_path = Some(PathBuf::from(next));
             }
             value if value.starts_with('-') => {
@@ -95,12 +93,8 @@ mod tests {
 
     #[test]
     fn parse_args_supports_explicit_output_path() {
-        let (input, output) = parse_args([
-            "input.md".into(),
-            "--output".into(),
-            "out.pdf".into(),
-        ])
-        .expect("args should parse");
+        let (input, output) = parse_args(["input.md".into(), "--output".into(), "out.pdf".into()])
+            .expect("args should parse");
 
         assert_eq!(input, PathBuf::from("input.md"));
         assert_eq!(output, PathBuf::from("out.pdf"));

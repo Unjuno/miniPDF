@@ -101,6 +101,41 @@ impl FontRegistry {
             }
         }
 
+        if !self.fonts.contains_key("NotoSansJP-Italic") {
+            if let Some(p) = system_fallback_japanese_italic() {
+                match oxidize_pdf::fonts::FontLoader::load_from_file(&p) {
+                    Ok(_) => {
+                        let p2 = p.clone();
+                        self.register_font("NotoSansJP-Italic".to_string(), p);
+                        info!("システムフォントを NotoSansJP-Italic として登録しました: {:?}", p2);
+                    }
+                    Err(e) => warn!(
+                        "システム斜体フォントを PDF 用に読み込めませんでした（スキップ）: {:?} — {}",
+                        p, e
+                    ),
+                }
+            }
+        }
+
+        if !self.fonts.contains_key("NotoSansJP-BoldItalic") {
+            if let Some(p) = system_fallback_japanese_bold_italic() {
+                match oxidize_pdf::fonts::FontLoader::load_from_file(&p) {
+                    Ok(_) => {
+                        let p2 = p.clone();
+                        self.register_font("NotoSansJP-BoldItalic".to_string(), p);
+                        info!(
+                            "システムフォントを NotoSansJP-BoldItalic として登録しました: {:?}",
+                            p2
+                        );
+                    }
+                    Err(e) => warn!(
+                        "システム太字斜体フォントを PDF 用に読み込めませんでした（スキップ）: {:?} — {}",
+                        p, e
+                    ),
+                }
+            }
+        }
+
         if !self.fonts.contains_key("Emoji") {
             if let Some(p) = system_fallback_emoji_font() {
                 match oxidize_pdf::fonts::FontLoader::load_from_file(&p) {
@@ -177,6 +212,44 @@ fn system_fallback_emoji_font() -> Option<PathBuf> {
     None
 }
 
+fn system_fallback_japanese_italic() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        let fonts = Path::new(&windir).join("Fonts");
+        let candidates = [
+            fonts.join("GOTHICI.TTF"),
+            fonts.join("YuGothI.ttc"),
+            fonts.join("meiryo.ttc"),
+        ];
+        for p in candidates {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn system_fallback_japanese_bold_italic() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+        let fonts = Path::new(&windir).join("Fonts");
+        let candidates = [
+            fonts.join("GOTHICBI.TTF"),
+            fonts.join("YuGothBI.ttc"),
+            fonts.join("meiryob.ttc"),
+        ];
+        for p in candidates {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 /// 実行ファイル隣接の `fonts/` に加え、開発時は `src-tauri/fonts/`（Cargo マニフェスト直下）も参照する。
 fn resolve_font_path(exe_font_dir: &Path, filename: &str) -> Option<PathBuf> {
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -195,6 +268,12 @@ fn resolve_font_path(exe_font_dir: &Path, filename: &str) -> Option<PathBuf> {
 /// レジストリに登録済みのフォントを PDF ドキュメントへ埋め込む。
 pub fn register_fonts_on_document(doc: &mut Document) -> Result<(), String> {
     for font_name in get_available_fonts() {
+        if font_name == "Emoji" {
+            // why: Emoji フォントは PDF 本体に埋め込まなくても、描画時の rasterize 用パスでのみ利用する
+            // alt: Emoji フォントも埋め込む（PDF.js が font data の解析に失敗して preview が壊れることがある）
+            // evidence: 画像として埋めた emoji はフォント埋め込みなしでも表示できる
+            continue;
+        }
         let Some(path) = get_font_path(&font_name) else {
             continue;
         };

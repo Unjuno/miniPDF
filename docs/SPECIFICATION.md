@@ -645,14 +645,17 @@ interface RenderMarkdownPreviewRequest {
 
 **レスポンス**:
 ```typescript
-type RenderMarkdownPreviewResponse = string; // 一時PDFファイルパス
+interface RenderMarkdownPreviewResponse {
+  filePath: string; // 一時PDFファイルパス
+  linePageMap: number[]; // 1-based source line index -> 1-based preview page
+}
 ```
 
 **実装**:
 ```rust
 #[tauri::command]
-async fn render_markdown_to_pdf_preview(markdown: String) -> Result<String, String> {
-    // Markdown -> PDFプレビュー生成
+async fn render_markdown_to_pdf_preview(markdown: String) -> Result<MarkdownPreviewResult, String> {
+    // Markdown -> PDFプレビュー生成 + ソース行ごとのページマップ
 }
 ```
 

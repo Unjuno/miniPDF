@@ -7,6 +7,7 @@ import { readFile } from '@tauri-apps/plugin-fs';
 import { getSourcePageNumber } from '../utils/pageMapping';
 import { renderBlankPage } from '../utils/renderBlankPage';
 import { logger } from '../utils/logger';
+import { useSinglePagePreviewScrollSync } from '../hooks/useSinglePagePreviewScrollSync';
 import './PDFViewer.css';
 
 // why: PDF.jsは重いライブラリのため、実際にPDFを読み込む時まで遅延読み込み
@@ -46,6 +47,9 @@ const InlineTextEditor = lazy(() => import('./InlineTextEditor').then(m => ({ de
 interface PDFViewerProps {
   pdfStructure: PdfStructure | null;
   zoomLevel: number;
+  editorCursorLine?: number;
+  previewSyncMarkdown?: string;
+  previewLinePageMap?: number[] | null;
   onPageChange?: (pageNumber: number) => void;
   /** When true (default), hide layout overlays and editing UI — print-style preview only. */
   previewOnly?: boolean;
@@ -57,6 +61,9 @@ interface PDFViewerProps {
 export const PDFViewer: React.FC<PDFViewerProps> = memo(({ 
   pdfStructure, 
   zoomLevel,
+  editorCursorLine = 1,
+  previewSyncMarkdown,
+  previewLinePageMap = null,
   onPageChange,
   previewOnly = true,
 }) => {
@@ -96,6 +103,7 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
   const adjustPageBreak = usePdfStore((state) => state.adjustPageBreak);
   const setCurrentPageInStore = usePdfStore((state) => state.setCurrentPage);
   const setError = usePdfStore((state) => state.setError);
+  const markdownText = usePdfStore((state) => state.markdownText);
   const isScrollingRef = useRef(false);
 
   // why: 複数の関連する状態をuseReducerで統合して再レンダリングを削減
@@ -838,6 +846,14 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
       container.removeEventListener('scroll', handleScroll);
     };
   }, [uiState.viewMode, pdfStructure, zoomLevel, currentPage, setCurrentPageInStore]);
+
+  useSinglePagePreviewScrollSync({
+    enabled: previewOnly && totalPages === 1,
+    markdownText: previewSyncMarkdown ?? markdownText,
+    editorCursorLine,
+    linePageMap: previewLinePageMap,
+    containerRef,
+  });
 
   // why: pdfStructure変更時にcurrentPageが有効な範囲内にあることを確認
   // alt: currentPageを調整しない（削除されたページを表示しようとしてエラーが発生）
@@ -1636,6 +1652,9 @@ export const PDFViewer: React.FC<PDFViewerProps> = memo(({
   // pdfStructureが同じでも、zoomLevelやonPageChangeが変更された場合は再レンダリング
   return (
     prevProps.zoomLevel === nextProps.zoomLevel &&
+    prevProps.editorCursorLine === nextProps.editorCursorLine &&
+    prevProps.previewSyncMarkdown === nextProps.previewSyncMarkdown &&
+    prevProps.previewLinePageMap === nextProps.previewLinePageMap &&
     prevProps.onPageChange === nextProps.onPageChange &&
     prevProps.previewOnly === nextProps.previewOnly
   );

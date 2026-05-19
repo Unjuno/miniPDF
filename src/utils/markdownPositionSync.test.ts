@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { estimatePreviewPageFromMarkdown, getLineNumberFromOffset } from './markdownPositionSync';
+import {
+  estimatePreviewPageFromMarkdown,
+  estimatePreviewScrollTopFromMarkdown,
+  getLineNumberFromOffset,
+  resolvePreviewPageFromMarkdown,
+} from './markdownPositionSync';
 
 describe('markdownPositionSync', () => {
   it('counts lines from a cursor offset', () => {
@@ -9,6 +14,23 @@ describe('markdownPositionSync', () => {
     expect(getLineNumberFromOffset(markdown, 4)).toBe(2);
     expect(getLineNumberFromOffset(markdown, 9)).toBe(3);
     expect(getLineNumberFromOffset(markdown, 100)).toBe(4);
+  });
+
+  it('uses the backend line page map when it matches the markdown line count', () => {
+    const markdown = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join('\n');
+    const linePageMap = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2];
+
+    expect(resolvePreviewPageFromMarkdown(markdown, 1, 4, linePageMap)).toBe(1);
+    expect(resolvePreviewPageFromMarkdown(markdown, 6, 4, linePageMap)).toBe(2);
+    expect(resolvePreviewPageFromMarkdown(markdown, 10, 4, linePageMap)).toBe(2);
+  });
+
+  it('uses the last mapped page when the map is shorter than the markdown', () => {
+    const markdown = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join('\n');
+    const partialMap = [1, 1, 2];
+
+    expect(resolvePreviewPageFromMarkdown(markdown, 10, 4, partialMap)).toBe(2);
+    expect(resolvePreviewPageFromMarkdown(markdown, 2, 4, partialMap)).toBe(1);
   });
 
   it('maps cursor line to a nearby preview page', () => {
@@ -104,5 +126,70 @@ describe('markdownPositionSync', () => {
     const structuredPage = estimatePreviewPageFromMarkdown(structured, 30, 4);
 
     expect(structuredPage).toBeGreaterThanOrEqual(plainPage);
+  });
+
+  it('keeps moving forward for structured content below headings, quotes, lists, and thematic breaks', () => {
+    const structured = [
+      '# Heading',
+      '',
+      '> quoted line',
+      '',
+      '- list item',
+      '',
+      '---',
+      '',
+      'plain text 1',
+      'plain text 2',
+      'plain text 3',
+      'plain text 4',
+      'plain text 5',
+      'plain text 6',
+      'plain text 7',
+      'plain text 8',
+      'plain text 9',
+      'plain text 10',
+      'plain text 11',
+      'plain text 12',
+      'plain text 13',
+      'plain text 14',
+      'plain text 15',
+      'plain text 16',
+      'plain text 17',
+      'plain text 18',
+      'plain text 19',
+      'plain text 20',
+    ].join('\n');
+
+    expect(estimatePreviewPageFromMarkdown(structured, 1, 5)).toBe(1);
+    expect(estimatePreviewPageFromMarkdown(structured, 3, 5)).toBeGreaterThanOrEqual(1);
+    expect(estimatePreviewPageFromMarkdown(structured, 5, 5)).toBeGreaterThanOrEqual(estimatePreviewPageFromMarkdown(structured, 3, 5));
+    expect(estimatePreviewPageFromMarkdown(structured, 7, 5)).toBeGreaterThanOrEqual(estimatePreviewPageFromMarkdown(structured, 5, 5));
+    expect(estimatePreviewPageFromMarkdown(structured, 28, 5)).toBe(5);
+  });
+
+  it('estimates a lower scroll position for later lines on a single-page preview', () => {
+    const markdown = [
+      '# Heading',
+      '',
+      'alpha',
+      'beta',
+      'gamma',
+      '',
+      'delta',
+      '',
+      'epsilon',
+      'zeta',
+      'eta',
+      'theta',
+    ].join('\n');
+
+    const top = estimatePreviewScrollTopFromMarkdown(markdown, 1, 800, 1600);
+    const middle = estimatePreviewScrollTopFromMarkdown(markdown, 6, 800, 1600);
+    const tail = estimatePreviewScrollTopFromMarkdown(markdown, 12, 800, 1600);
+
+    expect(top).toBe(0);
+    expect(middle).toBeGreaterThan(top);
+    expect(tail).toBeGreaterThan(middle);
+    expect(tail).toBeLessThanOrEqual(800);
   });
 });

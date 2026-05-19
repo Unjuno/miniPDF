@@ -10,7 +10,7 @@ use comrak::nodes::{AstNode, ListType, NodeCode, NodeCodeBlock, NodeMath, NodeVa
 use comrak::{parse_document, Arena, Options};
 use image::{DynamicImage, GenericImageView, ImageBuffer, ImageOutputFormat, Rgb};
 use oxidize_pdf::{Color, Document, Font, Image, Page as OxidizePage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::Format;
 use swash::FontRef;
@@ -24,6 +24,10 @@ const PAGE_WIDTH: f64 = 595.0;
 const PAGE_HEIGHT: f64 = 842.0;
 const MARGIN: f64 = 40.0;
 const BASE_LINE_HEIGHT: f64 = 16.0;
+/// Upper bound for consecutive blank source lines rendered as vertical space between blocks.
+/// why: test fixtures may contain huge blank runs; a cap prevents runaway PDF height while still
+///      allowing intentional blank lines for page-boundary tuning (~1 page of slack at 16pt/line).
+const MAX_SPACER_LINES: usize = 48;
 const MERMAID_MAX_DISPLAY_HEIGHT: f64 = 260.0;
 const MERMAID_PT_PER_PX: f64 = 0.75;
 const MATH_INLINE_Y_OFFSET_PT: f64 = -3.0;
@@ -31,6 +35,9 @@ const MATH_INLINE_EXTRA_LINE_PT: f64 = 8.0;
 const JP_SANS_FONT: &str = "NotoSansJP";
 const JP_SANS_BOLD: &str = "NotoSansJP-Bold";
 const EMOJI_FONT: &str = "Emoji";
+const LIST_MARKER_X: f64 = MARGIN + 4.0;
+const LIST_INDENT_STEP_PT: f64 = 11.0;
+const LIST_MARKER_TEXT_GAP_PT: f64 = 8.0;
 const EMOJI_RASTER_PX_PER_PT: f32 = 6.0;
 const EMOJI_DISPLAY_SCALE: f64 = 1.45;
 // PDF の座標は pt なので、いったん追加オフセットなしに戻す。
@@ -68,37 +75,121 @@ impl InlineSpan {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BlockSource {
+    start_line: u32,
+    end_line: u32,
+}
+
+impl BlockSource {
+    fn single(line: u32) -> Self {
+        Self {
+            start_line: line,
+            end_line: line,
+        }
+    }
+
+    fn from_node<'a>(node: &'a AstNode<'a>) -> Self {
+        let pos = node.data.borrow().sourcepos;
+        Self {
+            start_line: pos.start.line.max(1) as u32,
+            end_line: pos.end.line.max(1) as u32,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayoutLine {
+    spans: Vec<InlineSpan>,
+    source_line: u32,
+}
+
+#[derive(Debug)]
+struct PreviewLayoutState {
+    page_index: u32,
+    line_pages: Vec<u32>,
+}
+
+impl PreviewLayoutState {
+    fn new(source_line_count: usize) -> Self {
+        Self {
+            page_index: 1,
+            line_pages: vec![1; source_line_count.max(1)],
+        }
+    }
+
+    fn record_line(&mut self, line: u32) {
+        let idx = line.saturating_sub(1) as usize;
+        if idx < self.line_pages.len() {
+            self.line_pages[idx] = self.page_index;
+        }
+    }
+
+    fn record_source(&mut self, source: BlockSource) {
+        for line in source.start_line..=source.end_line {
+            self.record_line(line);
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownPreviewResult {
+    pub file_path: String,
+    pub line_page_map: Vec<u32>,
+}
+
 #[derive(Debug, Clone)]
 enum MarkdownBlock {
     Heading {
         level: usize,
         spans: Vec<InlineSpan>,
+        source: BlockSource,
     },
-    Paragraph(Vec<InlineSpan>),
+    Paragraph {
+        spans: Vec<InlineSpan>,
+        source: BlockSource,
+    },
     /// Markdown の空行をページレイアウトに反映するための余白ブロック。
     Spacer {
         lines: usize,
+        source: BlockSource,
     },
     /// ネストした箇条書きは `indent` を増やしてフラット化する。
     ListItem {
         indent: u8,
         spans: Vec<InlineSpan>,
+        source: BlockSource,
     },
     OrderedListItem {
         n: u32,
         indent: u8,
         spans: Vec<InlineSpan>,
+        source: BlockSource,
     },
     /// `---` / `***` / `___` などの区切り線。
-    ThematicBreak(ThematicBreakStyle),
+    ThematicBreak {
+        style: ThematicBreakStyle,
+        source: BlockSource,
+    },
     /// 各行はセルごとのインライン列（列数は行ごとに揃う想定）
-    Table(Vec<Vec<Vec<InlineSpan>>>),
+    Table {
+        rows: Vec<Vec<Vec<InlineSpan>>>,
+        source: BlockSource,
+    },
     CodeBlock {
         lang: String,
         code: String,
+        source: BlockSource,
     },
-    DisplayMath(String),
-    Blockquote(Vec<BlockquoteLine>),
+    DisplayMath {
+        expr: String,
+        source: BlockSource,
+    },
+    Blockquote {
+        lines: Vec<BlockquoteLine>,
+        source: BlockSource,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,19 +254,29 @@ fn scale_math_image(rendered: &MathRenderImage, max_height_pt: f64) -> (f64, f64
 }
 
 #[command]
-pub async fn render_markdown_to_pdf_preview(markdown: String) -> Result<String, String> {
+pub async fn render_markdown_to_pdf_preview(
+    markdown: String,
+) -> Result<MarkdownPreviewResult, String> {
     let output_path = build_preview_path();
-    let bytes = render_markdown_preview_pdf_bytes(&markdown)?;
+    let normalized = normalize_markdown_newlines(markdown.as_str());
+    let source_line_count = normalized.lines().count().max(1);
+    let blocks = parse_markdown_blocks(&normalized);
+    let (bytes, line_page_map) = build_preview_pdf(&blocks, source_line_count)?;
 
     fs::write(&output_path, &bytes)
         .map_err(|e| format!("プレビューPDFの書き込みに失敗しました: {e}"))?;
 
-    Ok(output_path.to_string_lossy().to_string())
+    Ok(MarkdownPreviewResult {
+        file_path: output_path.to_string_lossy().to_string(),
+        line_page_map,
+    })
 }
 
 pub fn render_markdown_preview_pdf_bytes(markdown: &str) -> Result<Vec<u8>, String> {
-    let blocks = parse_markdown_blocks(markdown);
-    build_preview_pdf(&blocks)
+    let normalized = normalize_markdown_newlines(markdown);
+    let source_line_count = normalized.lines().count().max(1);
+    let blocks = parse_markdown_blocks(&normalized);
+    build_preview_pdf(&blocks, source_line_count).map(|(bytes, _)| bytes)
 }
 
 #[command]
@@ -195,7 +296,7 @@ fn build_preview_html(blocks: &[MarkdownBlock]) -> String {
 
     for block in blocks {
         match block {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 for (html, est_h) in render_blockquote_html_chunks(lines, page_limit) {
                     if !pages.last().unwrap().is_empty() && current_height + est_h > page_limit {
                         pages.push(Vec::new());
@@ -389,7 +490,7 @@ fn build_preview_html(blocks: &[MarkdownBlock]) -> String {
 
 fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
     match block {
-        MarkdownBlock::Heading { level, spans } => {
+        MarkdownBlock::Heading { level, spans, .. } => {
             let tag = match level {
                 1 => "h1",
                 2 => "h2",
@@ -399,18 +500,18 @@ fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
             let est = if *level == 1 { 56.0 } else { 40.0 };
             (format!("<{tag}>{}</{tag}>", render_spans_html(spans)), est)
         }
-        MarkdownBlock::Paragraph(spans) => {
+        MarkdownBlock::Paragraph { spans, .. } => {
             let text = render_spans_html(spans);
             (format!("<p>{text}</p>"), 40.0 + (spans.len() as f64 * 8.0))
         }
-        MarkdownBlock::Spacer { lines } => {
+        MarkdownBlock::Spacer { lines, .. } => {
             let height = (*lines as f64).max(1.0) * 14.0;
             (
                 format!("<div class=\"blank-line-spacer\" style=\"height:{height}pt\"></div>"),
                 height,
             )
         }
-        MarkdownBlock::ListItem { indent, spans } => {
+        MarkdownBlock::ListItem { indent, spans, .. } => {
             let pad = 1 + *indent as usize;
             let text = render_spans_html(spans);
             (
@@ -418,7 +519,7 @@ fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
                 28.0,
             )
         }
-        MarkdownBlock::OrderedListItem { n, indent, spans } => {
+        MarkdownBlock::OrderedListItem { n, indent, spans, .. } => {
             let pad = 1 + *indent as usize;
             let text = render_spans_html(spans);
             (
@@ -426,7 +527,7 @@ fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
                 28.0,
             )
         }
-        MarkdownBlock::ThematicBreak(style) => {
+        MarkdownBlock::ThematicBreak { style, .. } => {
             let class = match style {
                 ThematicBreakStyle::Hyphen => "hr-hyphen",
                 ThematicBreakStyle::Asterisk => "hr-asterisk",
@@ -434,8 +535,8 @@ fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
             };
             (format!("<hr class=\"{class}\" />"), 18.0)
         }
-        MarkdownBlock::Table(rows) => (render_table_html(rows), 48.0 + rows.len() as f64 * 28.0),
-        MarkdownBlock::CodeBlock { lang, code } => {
+        MarkdownBlock::Table { rows, .. } => (render_table_html(rows), 48.0 + rows.len() as f64 * 28.0),
+        MarkdownBlock::CodeBlock { lang, code, .. } => {
             if lang == "mermaid" {
                 if let Ok(Some((png_data, _width, height))) = render_mermaid_png(code) {
                     let encoded = general_purpose::STANDARD.encode(png_data);
@@ -452,14 +553,14 @@ fn render_block_to_html(block: &MarkdownBlock) -> (String, f64) {
                 code.lines().count().max(1) as f64 * 20.0 + 28.0,
             )
         }
-        MarkdownBlock::DisplayMath(expr) => {
+        MarkdownBlock::DisplayMath { expr, .. } => {
             let escaped = escape_html(expr);
             (
                 format!("<div class=\"math-block\">{escaped}</div>"),
                 46.0 + expr.lines().count().max(1) as f64 * 12.0,
             )
         }
-        MarkdownBlock::Blockquote(lines) => {
+        MarkdownBlock::Blockquote { lines, .. } => {
             let html = render_blockquote_html_chunks(lines, f64::INFINITY)
                 .into_iter()
                 .next()
@@ -687,7 +788,131 @@ fn parse_markdown_blocks(markdown: &str) -> Vec<MarkdownBlock> {
     let root = parse_document(&arena, &markdown, &comrak_options());
     let mut blocks = Vec::new();
     push_blocks_from_children(root, &mut blocks, &markdown_lines);
-    blocks
+    finalize_block_spacers(blocks, &markdown_lines)
+}
+
+fn block_source(block: &MarkdownBlock) -> BlockSource {
+    match block {
+        MarkdownBlock::Heading { source, .. }
+        | MarkdownBlock::Paragraph { source, .. }
+        | MarkdownBlock::Spacer { source, .. }
+        | MarkdownBlock::ListItem { source, .. }
+        | MarkdownBlock::OrderedListItem { source, .. }
+        | MarkdownBlock::ThematicBreak { source, .. }
+        | MarkdownBlock::Table { source, .. }
+        | MarkdownBlock::CodeBlock { source, .. }
+        | MarkdownBlock::DisplayMath { source, .. }
+        | MarkdownBlock::Blockquote { source, .. } => *source,
+    }
+}
+
+fn count_blank_source_lines(markdown_lines: &[&str], start_line: u32, end_line: u32) -> usize {
+    if end_line < start_line {
+        return 0;
+    }
+    (start_line..=end_line)
+        .filter_map(|line| markdown_lines.get(line.saturating_sub(1) as usize))
+        .filter(|line| line.trim().is_empty())
+        .count()
+}
+
+fn trim_trailing_blank_source_lines(
+    markdown_lines: &[&str],
+    start_line: u32,
+    end_line: u32,
+) -> u32 {
+    let mut effective_end = end_line;
+    while effective_end > start_line {
+        let Some(line) = markdown_lines.get(effective_end as usize - 1) else {
+            break;
+        };
+        if line.trim().is_empty() {
+            effective_end -= 1;
+        } else {
+            break;
+        }
+    }
+    effective_end
+}
+
+fn trim_leading_blank_source_lines(
+    markdown_lines: &[&str],
+    start_line: u32,
+    end_line: u32,
+) -> u32 {
+    let mut effective_start = start_line;
+    while effective_start < end_line {
+        let Some(line) = markdown_lines.get(effective_start as usize - 1) else {
+            break;
+        };
+        if line.trim().is_empty() {
+            effective_start += 1;
+        } else {
+            break;
+        }
+    }
+    effective_start
+}
+
+fn effective_source_bounds(
+    block: &MarkdownBlock,
+    markdown_lines: &[&str],
+) -> BlockSource {
+    let source = block_source(block);
+    if matches!(
+        block,
+        MarkdownBlock::CodeBlock { .. } | MarkdownBlock::DisplayMath { .. }
+    ) {
+        return source;
+    }
+    let start = trim_leading_blank_source_lines(
+        markdown_lines,
+        source.start_line,
+        source.end_line,
+    );
+    let end = trim_trailing_blank_source_lines(markdown_lines, start, source.end_line);
+    BlockSource {
+        start_line: start,
+        end_line: end,
+    }
+}
+
+/// Inserts `Spacer` blocks for blank source lines between rendered blocks (lists, HR, headings, etc.).
+fn finalize_block_spacers(
+    blocks: Vec<MarkdownBlock>,
+    markdown_lines: &[&str],
+) -> Vec<MarkdownBlock> {
+    let content_blocks: Vec<MarkdownBlock> = blocks
+        .into_iter()
+        .filter(|block| !matches!(block, MarkdownBlock::Spacer { .. }))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut prev_end: Option<u32> = None;
+
+    for block in content_blocks {
+        let effective = effective_source_bounds(&block, markdown_lines);
+        if let Some(prev_end_line) = prev_end {
+            let gap_start = prev_end_line.saturating_add(1);
+            let gap_end = effective.start_line.saturating_sub(1);
+            if gap_start <= gap_end {
+                let blank_lines = count_blank_source_lines(markdown_lines, gap_start, gap_end);
+                if blank_lines > 0 {
+                    out.push(MarkdownBlock::Spacer {
+                        lines: blank_lines.min(MAX_SPACER_LINES),
+                        source: BlockSource {
+                            start_line: gap_start,
+                            end_line: gap_end,
+                        },
+                    });
+                }
+            }
+        }
+        out.push(block);
+        prev_end = Some(effective.end_line);
+    }
+
+    out
 }
 
 fn normalize_markdown_newlines(markdown: &str) -> String {
@@ -799,25 +1024,8 @@ fn push_blocks_from_children<'a>(
     blocks: &mut Vec<MarkdownBlock>,
     markdown_lines: &[&str],
 ) {
-    let mut previous_end_line: Option<usize> = None;
     for child in node.children() {
-        let sourcepos = child.data.borrow().sourcepos;
-        if let Some(prev_end_line) = previous_end_line {
-            let blank_lines = sourcepos
-                .start
-                .line
-                .saturating_sub(prev_end_line.saturating_add(1));
-            if blank_lines > 0 {
-                // why: 連続空行をそのまま全部余白化すると、テスト用 fixture の大きな空白塊が
-                //      過剰に広がってしまう。空行は効かせつつ、見た目は2行までに抑える。
-                // alt: 連続空行をすべて余白化する（長い空白がページレイアウトを壊しやすい）
-                blocks.push(MarkdownBlock::Spacer {
-                    lines: blank_lines.min(2),
-                });
-            }
-        }
         push_block(child, blocks, markdown_lines);
-        previous_end_line = Some(sourcepos.end.line);
     }
 }
 
@@ -842,7 +1050,11 @@ fn flatten_list_blocks<'a>(
                         NodeValue::Paragraph => {
                             let spans = paragraph_spans(child);
                             if !spans.is_empty() {
-                                blocks.push(MarkdownBlock::ListItem { indent, spans });
+                                blocks.push(MarkdownBlock::ListItem {
+                                    indent,
+                                    spans,
+                                    source: BlockSource::from_node(child),
+                                });
                             }
                         }
                         NodeValue::List(_) => {
@@ -868,7 +1080,12 @@ fn flatten_list_blocks<'a>(
                     match &child.data.borrow().value {
                         NodeValue::Paragraph => {
                             let spans = paragraph_spans(child);
-                            blocks.push(MarkdownBlock::OrderedListItem { n, indent, spans });
+                            blocks.push(MarkdownBlock::OrderedListItem {
+                                n,
+                                indent,
+                                spans,
+                                source: BlockSource::from_node(child),
+                            });
                         }
                         NodeValue::List(_) => {
                             flatten_list_blocks(
@@ -895,14 +1112,20 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>, markdo
             let mut lines = Vec::new();
             collect_blockquote_content(node, 0, &mut lines, markdown_lines);
             if !lines.is_empty() {
-                blocks.push(MarkdownBlock::Blockquote(lines));
+                blocks.push(MarkdownBlock::Blockquote {
+                    lines,
+                    source: BlockSource::from_node(node),
+                });
             }
         }
         NodeValue::MultilineBlockQuote(_) => {
             let mut lines = Vec::new();
             collect_blockquote_content(node, 0, &mut lines, markdown_lines);
             if !lines.is_empty() {
-                blocks.push(MarkdownBlock::Blockquote(lines));
+                blocks.push(MarkdownBlock::Blockquote {
+                    lines,
+                    source: BlockSource::from_node(node),
+                });
             }
         }
         NodeValue::List(_) => {
@@ -910,26 +1133,33 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>, markdo
         }
         NodeValue::Paragraph => {
             if let Some(expr) = paragraph_display_math_expr(node) {
-                blocks.push(MarkdownBlock::DisplayMath(expr));
+                blocks.push(MarkdownBlock::DisplayMath {
+                    expr,
+                    source: BlockSource::from_node(node),
+                });
             } else {
                 let spans = paragraph_spans(node);
                 if !spans.is_empty() {
-                    blocks.push(MarkdownBlock::Paragraph(spans));
+                    blocks.push(MarkdownBlock::Paragraph {
+                        spans,
+                        source: BlockSource::from_node(node),
+                    });
                 }
             }
         }
-        NodeValue::Math(math) => push_math_block(math, blocks),
+        NodeValue::Math(math) => push_math_block(math, node, blocks),
         NodeValue::Heading(h) => {
             let spans = paragraph_spans(node);
             if !spans.is_empty() {
                 blocks.push(MarkdownBlock::Heading {
                     level: h.level as usize,
                     spans,
+                    source: BlockSource::from_node(node),
                 });
             }
         }
         NodeValue::CodeBlock(nb) => {
-            blocks.push(code_block_from_node(nb));
+            blocks.push(code_block_from_node(nb, node));
         }
         NodeValue::Table(_) => {
             if let Some(t) = table_from_node(node) {
@@ -942,20 +1172,30 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>, markdo
                 .get(source_line)
                 .map(|line| classify_thematic_break_style(line))
                 .unwrap_or(ThematicBreakStyle::Hyphen);
-            blocks.push(MarkdownBlock::ThematicBreak(style));
+            blocks.push(MarkdownBlock::ThematicBreak {
+                style,
+                source: BlockSource::from_node(node),
+            });
         }
         NodeValue::HtmlBlock(nb) => {
             let t = nb.literal.trim();
             if !t.is_empty() {
                 let mut v = Vec::new();
                 InlineSpan::push(&mut v, t, TextStyle::default());
-                blocks.push(MarkdownBlock::Paragraph(v));
+                blocks.push(MarkdownBlock::Paragraph {
+                    spans: v,
+                    source: BlockSource::from_node(node),
+                });
             }
         }
         NodeValue::Item(_) => {
             let spans = item_first_paragraph_spans(node);
             if !spans.is_empty() {
-                blocks.push(MarkdownBlock::ListItem { indent: 0, spans });
+                blocks.push(MarkdownBlock::ListItem {
+                    indent: 0,
+                    spans,
+                    source: BlockSource::from_node(node),
+                });
             }
         }
         _ => {
@@ -966,10 +1206,11 @@ fn push_block<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<MarkdownBlock>, markdo
     }
 }
 
-fn code_block_from_node(nb: &NodeCodeBlock) -> MarkdownBlock {
+fn code_block_from_node<'a>(nb: &NodeCodeBlock, node: &'a AstNode<'a>) -> MarkdownBlock {
     MarkdownBlock::CodeBlock {
         lang: nb.info.trim().to_ascii_lowercase(),
         code: nb.literal.clone(),
+        source: BlockSource::from_node(node),
     }
 }
 
@@ -1005,7 +1246,10 @@ fn table_from_node<'a>(table: &'a AstNode<'a>) -> Option<MarkdownBlock> {
     if rows.is_empty() {
         None
     } else {
-        Some(MarkdownBlock::Table(rows))
+        Some(MarkdownBlock::Table {
+            rows,
+            source: BlockSource::from_node(table),
+        })
     }
 }
 
@@ -1032,7 +1276,11 @@ fn collect_blockquote_content<'a>(
                 flatten_list_blocks(c, 0, &mut flat, markdown_lines);
                 for b in flat {
                     match b {
-                        MarkdownBlock::ListItem { indent, mut spans } => {
+                        MarkdownBlock::ListItem {
+                            indent,
+                            mut spans,
+                            ..
+                        } => {
                             if spans.is_empty() {
                                 continue;
                             }
@@ -1050,6 +1298,7 @@ fn collect_blockquote_content<'a>(
                             n,
                             indent,
                             mut spans,
+                            ..
                         } => {
                             let mut line = Vec::new();
                             if level > 0 {
@@ -1074,13 +1323,13 @@ fn collect_blockquote_content<'a>(
                 push_block(c, &mut tmp, markdown_lines);
                 for b in tmp {
                     match b {
-                        MarkdownBlock::Paragraph(s) => {
+                        MarkdownBlock::Paragraph { spans: s, .. } => {
                             append_blockquote_text(out, level, s);
                         }
-                        MarkdownBlock::Blockquote(s) => {
+                        MarkdownBlock::Blockquote { lines: s, .. } => {
                             out.extend(s);
                         }
-                        MarkdownBlock::CodeBlock { lang, code } => {
+                        MarkdownBlock::CodeBlock { lang, code, .. } => {
                             append_blockquote_code_block(out, lang, code);
                         }
                         MarkdownBlock::Heading { spans, .. } if !spans.is_empty() => {
@@ -1768,9 +2017,17 @@ fn normalize_math_for_katex(expr: &str) -> String {
     s
 }
 
-fn push_math_block(math: &NodeMath, blocks: &mut Vec<MarkdownBlock>) {
+fn push_math_block<'a>(
+    math: &NodeMath,
+    node: &'a AstNode<'a>,
+    blocks: &mut Vec<MarkdownBlock>,
+) {
+    let source = BlockSource::from_node(node);
     if math.display_math {
-        blocks.push(MarkdownBlock::DisplayMath(math.literal.clone()));
+        blocks.push(MarkdownBlock::DisplayMath {
+            expr: math.literal.clone(),
+            source,
+        });
     } else if !math.literal.trim().is_empty() {
         let mut spans = Vec::new();
         InlineSpan::push(
@@ -1781,7 +2038,7 @@ fn push_math_block(math: &NodeMath, blocks: &mut Vec<MarkdownBlock>) {
                 ..TextStyle::default()
             },
         );
-        blocks.push(MarkdownBlock::Paragraph(spans));
+        blocks.push(MarkdownBlock::Paragraph { spans, source });
     }
 }
 
@@ -1934,10 +2191,84 @@ fn make_preview_face(doc: &Document, body: Font) -> PreviewFace {
     }
 }
 
-fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
+fn draw_list_item_paginated(
+    page: &mut OxidizePage,
+    indent: u8,
+    marker_text: &str,
+    spans: &[InlineSpan],
+    source: BlockSource,
+    face: &PreviewFace,
+    cursor_y: &mut f64,
+    budget: usize,
+    math_cache: &mut MathRenderCache,
+    doc: &mut Document,
+    layout: &mut PreviewLayoutState,
+) -> Result<(), String> {
+    let layout_lines = layout_spans_lines_with_source(spans, budget, source);
+    let marker_x = list_marker_x(indent);
+    let content_x = list_item_content_x(indent, marker_text, &face.body, 11.0);
+    let marker = vec![InlineSpan {
+        text: marker_text.to_string(),
+        style: TextStyle::default(),
+    }];
+
+    for (index, line) in layout_lines.iter().enumerate() {
+        if index == 0 {
+            layout.record_line(source.start_line);
+            *cursor_y = ensure_room(*cursor_y, BASE_LINE_HEIGHT, page, doc, layout);
+            draw_rich_line_segments(
+                page,
+                &marker,
+                face,
+                11.0,
+                marker_x,
+                cursor_y,
+                BASE_LINE_HEIGHT,
+                math_cache,
+            )?;
+            *cursor_y += BASE_LINE_HEIGHT;
+        }
+        layout.record_line(line.source_line);
+        *cursor_y = ensure_room(*cursor_y, BASE_LINE_HEIGHT, page, doc, layout);
+        draw_rich_line_segments(
+            page,
+            &line.spans,
+            face,
+            11.0,
+            content_x,
+            cursor_y,
+            BASE_LINE_HEIGHT,
+            math_cache,
+        )?;
+    }
+    *cursor_y -= 4.0;
+    Ok(())
+}
+
+fn record_code_block_source_lines(
+    layout: &mut PreviewLayoutState,
+    source: BlockSource,
+    rendered_line_count: usize,
+) {
+    if rendered_line_count == 0 {
+        layout.record_source(source);
+        return;
+    }
+    let span = source.end_line.saturating_sub(source.start_line);
+    for index in 0..rendered_line_count {
+        let line = source.start_line + (index as u32).min(span);
+        layout.record_line(line);
+    }
+}
+
+fn build_preview_pdf(
+    blocks: &[MarkdownBlock],
+    source_line_count: usize,
+) -> Result<(Vec<u8>, Vec<u32>), String> {
     let mut doc = Document::new();
     font_manager::register_fonts_on_document(&mut doc)?;
     let mut math_cache = MathRenderCache::default();
+    let mut layout = PreviewLayoutState::new(source_line_count);
 
     let body_font =
         if doc.has_custom_font(JP_SANS_FONT) {
@@ -1957,7 +2288,11 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
 
     for block in blocks {
         match block {
-            MarkdownBlock::Heading { level, spans } => {
+            MarkdownBlock::Heading {
+                level,
+                spans,
+                source,
+            } => {
                 let font_size = match level {
                     1 => 24.0,
                     2 => 20.0,
@@ -1966,157 +2301,132 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 };
                 let spacing_before = if *level == 1 { 12.0 } else { 8.0 };
                 let spacing_after = if *level == 1 { 10.0 } else { 8.0 };
-                let est =
-                    estimate_rich_block_height(spans, max_chars_for_font(font_size), font_size);
-                cursor_y = ensure_room(
-                    cursor_y,
-                    est + spacing_before + spacing_after,
-                    &mut page,
-                    &mut doc,
-                );
+                layout.record_line(source.start_line);
+                cursor_y = ensure_room(cursor_y, spacing_before, &mut page, &mut doc, &mut layout);
                 cursor_y -= spacing_before;
-                draw_rich_block(
+                draw_rich_block_paginated(
                     &mut page,
                     spans,
+                    *source,
                     &face,
                     font_size,
                     MARGIN,
                     &mut cursor_y,
                     max_chars_for_font(font_size),
                     &mut math_cache,
+                    &mut doc,
+                    &mut layout,
                 )?;
                 cursor_y -= spacing_after;
             }
-            MarkdownBlock::Paragraph(spans) => {
-                let est = estimate_rich_block_height(spans, 90, 11.5);
-                cursor_y = ensure_room(cursor_y, est + 4.0, &mut page, &mut doc);
-                draw_rich_block(
+            MarkdownBlock::Paragraph { spans, source } => {
+                draw_rich_block_paginated(
                     &mut page,
                     spans,
+                    *source,
                     &face,
                     11.5,
                     MARGIN,
                     &mut cursor_y,
                     90,
                     &mut math_cache,
+                    &mut doc,
+                    &mut layout,
                 )?;
                 cursor_y -= 4.0;
             }
-            MarkdownBlock::Spacer { lines } => {
-                let spacer_height = (*lines as f64).max(1.0) * BASE_LINE_HEIGHT;
-                cursor_y = ensure_room(cursor_y, spacer_height, &mut page, &mut doc);
-                cursor_y -= spacer_height;
-            }
-            MarkdownBlock::ListItem { indent, spans } => {
-                let ind = *indent;
-                let bullet = if ind > 0 {
-                    format!("{}• ", "  ".repeat(ind as usize))
-                } else {
-                    "• ".to_string()
-                };
-                let prefix_cols = unicode_display_width(bullet.as_str());
-                let budget = 90usize.saturating_sub(prefix_cols + 4).max(20);
-                let est = estimate_rich_block_height(spans, budget, 11.0) + BASE_LINE_HEIGHT;
-                cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
-                let lines = layout_spans_lines(spans, budget);
-                let prefix_x = MARGIN + 4.0;
-                let content_x = list_item_content_x(&bullet, &face.body, 11.0);
-                let mut first = true;
-                for line in lines {
-                    if first {
-                        first = false;
-                        let mut prefixed = Vec::new();
-                        InlineSpan::push(&mut prefixed, &bullet, TextStyle::default());
-                        prefixed.extend(line);
-                        draw_rich_line_segments(
-                            &mut page,
-                            &prefixed,
-                            &face,
-                            11.0,
-                            prefix_x,
-                            &mut cursor_y,
-                            BASE_LINE_HEIGHT,
-                            &mut math_cache,
-                        )?;
-                    } else {
-                        draw_rich_line_segments(
-                            &mut page,
-                            &line,
-                            &face,
-                            11.0,
-                            content_x,
-                            &mut cursor_y,
-                            BASE_LINE_HEIGHT,
-                            &mut math_cache,
-                        )?;
-                    }
+            MarkdownBlock::Spacer { lines, source } => {
+                let visible_lines = (*lines).max(1);
+                let span = source.end_line.saturating_sub(source.start_line) as usize;
+                for index in 0..visible_lines {
+                    let line = source.start_line + (index as u32).min(span as u32);
+                    layout.record_line(line);
+                    cursor_y =
+                        ensure_room(cursor_y, BASE_LINE_HEIGHT, &mut page, &mut doc, &mut layout);
+                    cursor_y -= BASE_LINE_HEIGHT;
                 }
-                cursor_y -= 4.0;
-            }
-            MarkdownBlock::OrderedListItem { n, indent, spans } => {
-                let ind = *indent;
-                let prefix = if ind > 0 {
-                    format!("{}{}. ", "  ".repeat(ind as usize), n)
-                } else {
-                    format!("{n}. ")
-                };
-                let prefix_cols = unicode_display_width(prefix.as_str());
-                let budget = 90usize.saturating_sub(prefix_cols + 4).max(20);
-                let est = estimate_rich_block_height(spans, budget, 11.0) + BASE_LINE_HEIGHT;
-                cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
-                let lines = layout_spans_lines(spans, budget);
-                let prefix_x = MARGIN + 4.0;
-                let content_x = list_item_content_x(&prefix, &face.body, 11.0);
-                let mut first = true;
-                for line in lines {
-                    if first {
-                        first = false;
-                        let mut row = Vec::new();
-                        InlineSpan::push(&mut row, &prefix, TextStyle::default());
-                        row.extend(line);
-                        draw_rich_line_segments(
-                            &mut page,
-                            &row,
-                            &face,
-                            11.0,
-                            prefix_x,
-                            &mut cursor_y,
-                            BASE_LINE_HEIGHT,
-                            &mut math_cache,
-                        )?;
-                    } else {
-                        draw_rich_line_segments(
-                            &mut page,
-                            &line,
-                            &face,
-                            11.0,
-                            content_x,
-                            &mut cursor_y,
-                            BASE_LINE_HEIGHT,
-                            &mut math_cache,
-                        )?;
-                    }
+                let last_drawn = source
+                    .start_line
+                    .saturating_add((visible_lines as u32).saturating_sub(1))
+                    .min(source.end_line);
+                for line in last_drawn.saturating_add(1)..=source.end_line {
+                    layout.record_line(line);
                 }
-                cursor_y -= 4.0;
             }
-            MarkdownBlock::ThematicBreak(style) => {
-                cursor_y = draw_thematic_break(&mut page, cursor_y, *style, &mut doc);
+            MarkdownBlock::ListItem {
+                indent,
+                spans,
+                source,
+            } => {
+                let ind = *indent;
+                let bullet = "•";
+                let prefix_cols = (ind as usize * 2) + unicode_display_width(bullet) + 2usize;
+                let budget = 90usize.saturating_sub(prefix_cols + 4).max(20);
+                draw_list_item_paginated(
+                    &mut page,
+                    ind,
+                    bullet,
+                    spans,
+                    *source,
+                    &face,
+                    &mut cursor_y,
+                    budget,
+                    &mut math_cache,
+                    &mut doc,
+                    &mut layout,
+                )?;
             }
-            MarkdownBlock::Table(rows) => {
+            MarkdownBlock::OrderedListItem {
+                n,
+                indent,
+                spans,
+                source,
+            } => {
+                let ind = *indent;
+                let prefix = format!("{n}.");
+                let prefix_cols = (ind as usize * 2) + unicode_display_width(prefix.as_str()) + 2;
+                let budget = 90usize.saturating_sub(prefix_cols + 4).max(20);
+                draw_list_item_paginated(
+                    &mut page,
+                    ind,
+                    &prefix,
+                    spans,
+                    *source,
+                    &face,
+                    &mut cursor_y,
+                    budget,
+                    &mut math_cache,
+                    &mut doc,
+                    &mut layout,
+                )?;
+            }
+            MarkdownBlock::ThematicBreak { style, source } => {
+                layout.record_line(source.start_line);
+                cursor_y =
+                    draw_thematic_break(&mut page, cursor_y, *style, &mut doc, &mut layout);
+            }
+            MarkdownBlock::Table { rows, source } => {
+                layout.record_source(*source);
                 let row_h = 16.0_f64;
                 let n = rows.len().max(1);
                 let est = row_h * n as f64 + 16.0;
-                cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc);
+                cursor_y = ensure_room(cursor_y, est, &mut page, &mut doc, &mut layout);
                 draw_table(&mut page, rows, &face, &mut cursor_y, row_h)?;
                 cursor_y -= 4.0;
             }
-            MarkdownBlock::CodeBlock { lang, code } => {
+            MarkdownBlock::CodeBlock {
+                lang,
+                code,
+                source,
+            } => {
                 if lang == "mermaid" {
                     if let Some((png_data, width, height)) = render_mermaid_png(code)? {
                         let jpeg_data = normalize_mermaid_jpeg_bytes(&png_data)?;
                         let (draw_x, draw_width, draw_height) =
                             fit_mermaid_image_to_page(width, height);
-                        cursor_y = ensure_room(cursor_y, draw_height + 18.0, &mut page, &mut doc);
+                        layout.record_source(*source);
+                        cursor_y =
+                            ensure_room(cursor_y, draw_height + 18.0, &mut page, &mut doc, &mut layout);
                         draw_image_on_page(
                             &mut page,
                             &jpeg_data,
@@ -2156,9 +2466,11 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     cursor_y -= lh * 2.0 + 2.0;
                 }
                 let code_lines = wrap_code_lines(code, 88);
+                record_code_block_source_lines(&mut layout, *source, code_lines.len());
                 let whole_block_h = code_lines.len().max(1) as f64 * lh + pad_y * 2.0;
                 if code_block_fits_on_single_page(whole_block_h) {
-                    cursor_y = ensure_room(cursor_y, whole_block_h + 8.0, &mut page, &mut doc);
+                    cursor_y =
+                        ensure_room(cursor_y, whole_block_h + 8.0, &mut page, &mut doc, &mut layout);
                     let block_left = MARGIN + 4.0;
                     let block_width = PAGE_WIDTH - 2.0 * MARGIN - 8.0;
                     let block_bottom = cursor_y - whole_block_h;
@@ -2195,7 +2507,8 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                         let chunk_len = lines_remaining.min(lines_fit);
                         let chunk = &code_lines[idx..idx + chunk_len];
                         let block_h = chunk.len().max(1) as f64 * lh + pad_y * 2.0;
-                        cursor_y = ensure_room(cursor_y, block_h + 8.0, &mut page, &mut doc);
+                        cursor_y =
+                            ensure_room(cursor_y, block_h + 8.0, &mut page, &mut doc, &mut layout);
                         let block_left = MARGIN + 4.0;
                         let block_width = PAGE_WIDTH - 2.0 * MARGIN - 8.0;
                         let block_bottom = cursor_y - block_h;
@@ -2227,7 +2540,8 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                 continue;
             }
 
-            MarkdownBlock::DisplayMath(expr) => {
+            MarkdownBlock::DisplayMath { expr, source } => {
+                layout.record_source(*source);
                 cursor_y = draw_display_math_block(
                     &mut page,
                     expr,
@@ -2235,28 +2549,30 @@ fn build_preview_pdf(blocks: &[MarkdownBlock]) -> Result<Vec<u8>, String> {
                     cursor_y,
                     &mut doc,
                     &mut math_cache,
+                    &mut layout,
                 )?;
             }
 
-            MarkdownBlock::Blockquote(lines) => {
-                cursor_y =
-                    draw_blockquote(&mut page, lines, &face, cursor_y, &mut doc, &mut math_cache)?;
+            MarkdownBlock::Blockquote { lines, source } => {
+                layout.record_source(*source);
+                cursor_y = draw_blockquote(
+                    &mut page,
+                    lines,
+                    &face,
+                    cursor_y,
+                    &mut doc,
+                    &mut math_cache,
+                    &mut layout,
+                )?;
             }
         }
     }
 
     doc.add_page(page);
-    doc.to_bytes()
-        .map_err(|e| format!("プレビューPDFの生成に失敗しました: {e}"))
-}
-
-fn estimate_rich_block_height(spans: &[InlineSpan], max_cols: usize, font_size: f64) -> f64 {
-    let lines = layout_spans_lines(spans, max_cols);
-    lines
-        .iter()
-        .map(|line| estimate_rich_line_height(line, font_size))
-        .sum::<f64>()
-        .max(BASE_LINE_HEIGHT)
+    let bytes = doc
+        .to_bytes()
+        .map_err(|e| format!("プレビューPDFの生成に失敗しました: {e}"))?;
+    Ok((bytes, layout.line_pages))
 }
 
 fn estimate_rich_line_height(line: &[InlineSpan], font_size: f64) -> f64 {
@@ -2272,22 +2588,27 @@ fn estimate_rich_line_height(line: &[InlineSpan], font_size: f64) -> f64 {
     }
 }
 
-fn draw_rich_block(
+fn draw_rich_block_paginated(
     page: &mut OxidizePage,
     spans: &[InlineSpan],
+    source: BlockSource,
     face: &PreviewFace,
     default_size: f64,
     x0: f64,
     cursor_y: &mut f64,
     max_cols: usize,
     math_cache: &mut MathRenderCache,
+    doc: &mut Document,
+    layout: &mut PreviewLayoutState,
 ) -> Result<(), String> {
-    let lines = layout_spans_lines(spans, max_cols);
+    let lines = layout_spans_lines_with_source(spans, max_cols, source);
     for line in lines {
-        let line_height = estimate_rich_line_height(&line, default_size);
+        let line_height = estimate_rich_line_height(&line.spans, default_size);
+        layout.record_line(line.source_line);
+        *cursor_y = ensure_room(*cursor_y, line_height, page, doc, layout);
         draw_rich_line_segments(
             page,
-            &line,
+            &line.spans,
             face,
             default_size,
             x0,
@@ -2300,15 +2621,32 @@ fn draw_rich_block(
 }
 
 fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSpan>> {
+    layout_spans_lines_with_source(spans, max_cols, BlockSource::single(1))
+        .into_iter()
+        .map(|line| line.spans)
+        .collect()
+}
+
+fn layout_spans_lines_with_source(
+    spans: &[InlineSpan],
+    max_cols: usize,
+    source: BlockSource,
+) -> Vec<LayoutLine> {
     let flat = flatten_spans(spans);
     if flat.is_empty() {
-        return vec![vec![]];
+        return vec![LayoutLine {
+            spans: vec![],
+            source_line: source.start_line,
+        }];
     }
-    let mut lines: Vec<Vec<InlineSpan>> = Vec::new();
+    let mut lines: Vec<LayoutLine> = Vec::new();
     let mut cur_line: Vec<(String, TextStyle)> = Vec::new();
     let mut cur_width = 0usize;
+    let mut current_source_line = source.start_line;
 
-    let flush_line = |cur_line: &mut Vec<(String, TextStyle)>, lines: &mut Vec<Vec<InlineSpan>>| {
+    let flush_line = |cur_line: &mut Vec<(String, TextStyle)>,
+                          lines: &mut Vec<LayoutLine>,
+                          current_source_line: u32| {
         if cur_line.is_empty() {
             return;
         }
@@ -2317,20 +2655,26 @@ fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSp
             InlineSpan::push(&mut out, &t, st);
         }
         merge_adjacent_spans(&mut out);
-        lines.push(out);
+        lines.push(LayoutLine {
+            spans: out,
+            source_line: current_source_line,
+        });
     };
 
     for token in flat {
         match token {
             LayoutToken::Break => {
-                flush_line(&mut cur_line, &mut lines);
+                flush_line(&mut cur_line, &mut lines, current_source_line);
                 cur_width = 0;
+                if current_source_line < source.end_line {
+                    current_source_line += 1;
+                }
                 continue;
             }
             LayoutToken::Char(ch, st) => {
                 let w = char_display_width(ch);
                 if cur_width + w > max_cols && cur_width > 0 {
-                    flush_line(&mut cur_line, &mut lines);
+                    flush_line(&mut cur_line, &mut lines, current_source_line);
                     cur_width = 0;
                 }
                 if let Some(last) = cur_line.last_mut() {
@@ -2347,7 +2691,7 @@ fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSp
             LayoutToken::Math(expr, st) => {
                 let w = math_display_width(&expr);
                 if cur_width + w > max_cols && cur_width > 0 {
-                    flush_line(&mut cur_line, &mut lines);
+                    flush_line(&mut cur_line, &mut lines, current_source_line);
                     cur_width = 0;
                 }
                 cur_line.push((expr, st));
@@ -2355,9 +2699,12 @@ fn layout_spans_lines(spans: &[InlineSpan], max_cols: usize) -> Vec<Vec<InlineSp
             }
         }
     }
-    flush_line(&mut cur_line, &mut lines);
+    flush_line(&mut cur_line, &mut lines, current_source_line);
     if lines.is_empty() {
-        lines.push(vec![]);
+        lines.push(LayoutLine {
+            spans: vec![],
+            source_line: source.start_line,
+        });
     }
     lines
 }
@@ -3147,8 +3494,12 @@ fn approx_width_pt(text: &str, font: &Font, font_size: f64) -> f64 {
     }
 }
 
-fn list_item_content_x(prefix: &str, font: &Font, font_size: f64) -> f64 {
-    MARGIN + 4.0 + approx_width_pt(prefix, font, font_size) + 4.0
+fn list_marker_x(indent: u8) -> f64 {
+    LIST_MARKER_X + f64::from(indent) * LIST_INDENT_STEP_PT
+}
+
+fn list_item_content_x(indent: u8, marker: &str, font: &Font, font_size: f64) -> f64 {
+    list_marker_x(indent) + approx_width_pt(marker, font, font_size) + LIST_MARKER_TEXT_GAP_PT
 }
 
 fn should_fake_italic(_face: &PreviewFace, style: TextStyle, text: &str) -> bool {
@@ -3263,6 +3614,7 @@ fn draw_blockquote(
     cursor_y: f64,
     doc: &mut Document,
     math_cache: &mut MathRenderCache,
+    layout: &mut PreviewLayoutState,
 ) -> Result<f64, String> {
     let top_pad = 12.0;
     let bottom_pad = 10.0;
@@ -3294,7 +3646,7 @@ fn draw_blockquote(
             segment_end += 1;
         }
 
-        page_cursor = ensure_room(page_cursor, segment_height + 6.0, page, doc);
+        page_cursor = ensure_room(page_cursor, segment_height + 6.0, page, doc, layout);
         let y_top = page_cursor;
         let y_bottom = y_top - segment_height;
 
@@ -3472,9 +3824,10 @@ fn draw_thematic_break(
     cursor_y: f64,
     style: ThematicBreakStyle,
     doc: &mut Document,
+    layout: &mut PreviewLayoutState,
 ) -> f64 {
     let h = 18.0_f64;
-    let cursor_y = ensure_room(cursor_y, h, page, doc);
+    let cursor_y = ensure_room(cursor_y, h, page, doc, layout);
     let y = cursor_y - h * 0.5;
     let x0 = MARGIN + 10.0;
     let x1 = PAGE_WIDTH - MARGIN - 10.0;
@@ -3541,6 +3894,7 @@ fn draw_display_math_block(
     cursor_y: f64,
     doc: &mut Document,
     math_cache: &mut MathRenderCache,
+    layout: &mut PreviewLayoutState,
 ) -> Result<f64, String> {
     let font_size = 12.5;
     let top_pad = 12.0;
@@ -3549,7 +3903,7 @@ fn draw_display_math_block(
         let content_max_height = (PAGE_HEIGHT / 3.2).max(rendered.height_pt);
         let (draw_width, draw_height) = scale_math_image(&rendered, content_max_height);
         let block_h = draw_height + top_pad + bottom_pad;
-        let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc);
+        let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc, layout);
         let y_top = page_cursor;
         let y_bottom = y_top - block_h;
         let draw_x = MARGIN + ((PAGE_WIDTH - 2.0 * MARGIN) - draw_width) / 2.0;
@@ -3570,7 +3924,7 @@ fn draw_display_math_block(
     let lines = format_math_expression(expr);
     let line_height = 18.0;
     let block_h = lines.len().max(1) as f64 * line_height + top_pad + bottom_pad;
-    let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc);
+    let mut page_cursor = ensure_room(cursor_y, block_h + 6.0, page, doc, layout);
     let y_top = page_cursor;
     let y_bottom = y_top - block_h;
 
@@ -3627,6 +3981,7 @@ fn ensure_room(
     required_height: f64,
     page: &mut OxidizePage,
     doc: &mut Document,
+    layout: &mut PreviewLayoutState,
 ) -> f64 {
     if cursor_y - required_height > MARGIN {
         return cursor_y;
@@ -3647,6 +4002,7 @@ fn ensure_room(
     let mut next_page = OxidizePage::new(PAGE_WIDTH, PAGE_HEIGHT);
     std::mem::swap(page, &mut next_page);
     doc.add_page(next_page);
+    layout.page_index += 1;
     PAGE_HEIGHT - MARGIN
 }
 
@@ -3907,6 +4263,49 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn preview_pdf_bytes(blocks: &[MarkdownBlock]) -> Vec<u8> {
+        build_preview_pdf(blocks, 512)
+            .expect("preview PDF should be generated")
+            .0
+    }
+
+    fn preview_layout(markdown_line_count: usize, blocks: &[MarkdownBlock]) -> (Vec<u8>, Vec<u32>) {
+        build_preview_pdf(blocks, markdown_line_count.max(1))
+            .expect("preview PDF should be generated")
+    }
+
+    #[test]
+    fn hard_break_lines_map_to_later_preview_pages() {
+        let mut lines: Vec<String> = Vec::new();
+        for index in 1..=80 {
+            lines.push(format!("line {index}"));
+        }
+        let pivot = 40usize;
+        lines[pivot - 1].push_str("  ");
+        let markdown = lines.join("\n");
+        let line_count = markdown.lines().count();
+        let blocks = parse_markdown_blocks(&markdown);
+        let (_bytes, line_page_map) = preview_layout(line_count, &blocks);
+
+        assert!(
+            line_page_map.len() >= line_count,
+            "map_len={}, line_count={line_count}",
+            line_page_map.len()
+        );
+        assert!(
+            line_page_map[line_count - 1] >= line_page_map[0],
+            "tail_page={}, head_page={}",
+            line_page_map[line_count - 1],
+            line_page_map[0]
+        );
+        assert!(
+            line_page_map[pivot] >= line_page_map[0],
+            "break_line_page={}, head_page={}",
+            line_page_map[pivot],
+            line_page_map[0]
+        );
+    }
+
     #[test]
     fn parse_ordered_list_separate_blocks() {
         let md = "1. first\n2. second\n";
@@ -3918,11 +4317,13 @@ mod tests {
                     n: 1,
                     indent: 0,
                     spans: a,
+                    ..
                 },
                 MarkdownBlock::OrderedListItem {
                     n: 2,
                     indent: 0,
                     spans: b,
+                    ..
                 },
             ) => {
                 assert_eq!(plain_text(&a), "first");
@@ -3939,7 +4340,7 @@ mod tests {
         assert_eq!(b.len(), 1);
         match &b[0] {
             // GFM の AST では区切り行は TableRow にならず、ヘッダ + データ行のみのことが多い
-            MarkdownBlock::Table(rows) => assert!(rows.len() >= 2, "rows={:?}", rows),
+            MarkdownBlock::Table { rows, .. } => assert!(rows.len() >= 2, "rows={:?}", rows),
             _ => panic!("expected table"),
         }
     }
@@ -3968,7 +4369,7 @@ mod tests {
         let md = "Hello **world** and `code`.\n";
         let b = parse_markdown_blocks(md);
         match &b[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 assert!(
                     spans
                         .iter()
@@ -3989,7 +4390,7 @@ mod tests {
         let md = "line one\nline two\n";
         let b = parse_markdown_blocks(md);
         match &b[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 let t = plain_text(spans);
                 assert!(
                     t.contains('\n'),
@@ -4005,7 +4406,7 @@ mod tests {
         let md = "line one  \r\nline two\r\n";
         let b = parse_markdown_blocks(md);
         match &b[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 let t = plain_text(spans);
                 assert!(
                     t.contains('\n'),
@@ -4025,6 +4426,99 @@ mod tests {
     }
 
     #[test]
+    fn intro_cjk_soft_break_before_list_stays_single_paragraph() {
+        let md = "# Title\n\nこのファイルは、Markdownレンダラーが各種Markdown構文を正し\nく描画できるか確認するためのテスト用Markdownです。\n\n確認対象:\n\n- CommonMark\n";
+        let blocks = parse_markdown_blocks(md);
+        let intro = blocks.iter().find_map(|block| {
+            if let MarkdownBlock::Paragraph { spans, source } = block {
+                let text = plain_text(spans);
+                if text.contains("正し") && text.contains("く描画") {
+                    return Some((spans.clone(), *source));
+                }
+                None
+            } else {
+                None
+            }
+        });
+        let (spans, source) = intro.expect("expected one intro paragraph with a soft break");
+        let text = plain_text(&spans);
+        assert!(text.contains('\n'), "expected soft break newline, got {text:?}");
+        assert!(source.end_line > source.start_line, "expected multi-line source range");
+
+        let layout_lines = layout_spans_lines_with_source(&spans, 90, source);
+        assert!(
+            layout_lines.len() >= 2,
+            "expected wrapped/soft-break layout lines, got {}",
+            layout_lines.len()
+        );
+    }
+
+    #[test]
+    fn intro_cjk_blank_line_between_halves_splits_into_separate_paragraphs() {
+        let md = "# Title\n\nこのファイルは、Markdownレンダラーが各種Markdown構文を正し\n\nく描画できるか確認するためのテスト用Markdownです。\n\n確認対象:\n\n- CommonMark\n";
+        let blocks = parse_markdown_blocks(md);
+        let intro_paras: Vec<_> = blocks
+            .iter()
+            .filter_map(|block| {
+                if let MarkdownBlock::Paragraph { spans, .. } = block {
+                    let text = plain_text(spans);
+                    if text.contains("正し") || text.contains("く描画") {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            intro_paras.len(),
+            2,
+            "expected blank line to split intro into two paragraphs, got {intro_paras:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| matches!(block, MarkdownBlock::Spacer { .. })),
+            "expected spacer between split paragraphs"
+        );
+    }
+
+    #[tokio::test]
+    async fn intro_cjk_soft_break_before_list_renders_without_large_vertical_gap() {
+        let md = "# Title\n\nこのファイルは、Markdownレンダラーが各種Markdown構文を正し\nく描画できるか確認するためのテスト用Markdownです。\n\n確認対象:\n\n- CommonMark\n";
+        let blocks = parse_markdown_blocks(md);
+        let line_count = md.lines().count();
+        let bytes = preview_layout(line_count, &blocks).0;
+        let temp_dir = tempfile::tempdir().expect("temp dir should be created");
+        let pdf_path = temp_dir.path().join("intro-soft-break.pdf");
+        std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
+        let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
+            .await
+            .expect("generated preview PDF should be readable");
+
+        let mut first_y: Option<f64> = None;
+        let mut second_y: Option<f64> = None;
+        for page in &loaded.pages {
+            for block in &page.text_blocks {
+                if block.text.contains("正し") {
+                    first_y = Some(first_y.map_or(block.y, |y| y.max(block.y)));
+                }
+                if block.text.contains("く描画") {
+                    second_y = Some(second_y.map_or(block.y, |y| y.min(block.y)));
+                }
+            }
+        }
+
+        let first_y = first_y.expect("expected first intro line in PDF text");
+        let second_y = second_y.expect("expected second intro line in PDF text");
+        let gap = (first_y - second_y).abs();
+        assert!(
+            gap <= BASE_LINE_HEIGHT * 2.5,
+            "expected intro soft-break lines to stay adjacent, gap={gap}"
+        );
+    }
+
+    #[test]
     fn paragraph_soft_breaks_survive_ascii_and_cjk_input() {
         let md = "ASCII input\nnext line\n\n半角入力\n次の行\n";
         let b = parse_markdown_blocks(md);
@@ -4032,9 +4526,15 @@ mod tests {
 
         match (&b[0], &b[1], &b[2]) {
             (
-                MarkdownBlock::Paragraph(first),
-                MarkdownBlock::Spacer { lines: 1 },
-                MarkdownBlock::Paragraph(second),
+                MarkdownBlock::Paragraph {
+                    spans: first,
+                    ..
+                },
+                MarkdownBlock::Spacer { lines: 1, .. },
+                MarkdownBlock::Paragraph {
+                    spans: second,
+                    ..
+                },
             ) => {
                 let first_text = plain_text(first);
                 let second_text = plain_text(second);
@@ -4173,7 +4673,7 @@ mod tests {
 
         let mut first_page_count = None;
         for _ in 0..3 {
-            let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+            let bytes = preview_pdf_bytes(&blocks);
             let temp_dir = tempfile::tempdir().expect("temp dir should be created");
             let pdf_path = temp_dir.path().join("preview-consistency.pdf");
             std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -4209,7 +4709,7 @@ mod tests {
 
         let mut page_counts = Vec::new();
         for _ in 0..2 {
-            let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+            let bytes = preview_pdf_bytes(&blocks);
             let temp_dir = tempfile::tempdir().expect("temp dir should be created");
             let pdf_path = temp_dir.path().join("markdown-renderer-visual-check.pdf");
             std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -4236,7 +4736,7 @@ mod tests {
             assert!(
                 blocks.iter().any(|block| matches!(
                     block,
-                    MarkdownBlock::Heading { level: 2, spans }
+                    MarkdownBlock::Heading { level: 2, spans, .. }
                         if plain_text(spans).contains("Unicode / 日本語 / 絵文字")
                 )),
                 "expected the post-Mermaid heading to remain parseable: {blocks:?}"
@@ -4244,7 +4744,7 @@ mod tests {
             assert!(
                 blocks.iter().any(|block| matches!(
                     block,
-                    MarkdownBlock::Heading { level: 2, spans }
+                    MarkdownBlock::Heading { level: 2, spans, .. }
                         if plain_text(spans).contains("終端確認")
                 )),
                 "expected the visual fixture tail to remain parseable: {blocks:?}"
@@ -4286,8 +4786,8 @@ mod tests {
         let spaced_blocks = parse_markdown_blocks(&spaced);
 
         let compact_bytes =
-            build_preview_pdf(&compact_blocks).expect("compact preview should build");
-        let spaced_bytes = build_preview_pdf(&spaced_blocks).expect("spaced preview should build");
+            preview_pdf_bytes(&compact_blocks);
+        let spaced_bytes = preview_pdf_bytes(&spaced_blocks);
 
         let temp_dir = tempdir().expect("temp dir should be created");
         let compact_path = temp_dir.path().join("compact.pdf");
@@ -4304,10 +4804,9 @@ mod tests {
                 .await
                 .expect("spaced PDF should be readable");
 
-        assert_eq!(
-            compact_loaded.pages.len(),
-            spaced_loaded.pages.len(),
-            "compact_pages={}, spaced_pages={}",
+        assert!(
+            spaced_loaded.pages.len() >= compact_loaded.pages.len(),
+            "expected extra blank lines to push content toward later pages, compact_pages={}, spaced_pages={}",
             compact_loaded.pages.len(),
             spaced_loaded.pages.len()
         );
@@ -4330,14 +4829,17 @@ mod tests {
                 MarkdownBlock::ListItem {
                     indent: 0,
                     spans: a,
+                    ..
                 },
                 MarkdownBlock::ListItem {
                     indent: 0,
                     spans: b,
+                    ..
                 },
                 MarkdownBlock::ListItem {
                     indent: 1,
                     spans: n,
+                    ..
                 },
             ) => {
                 assert!(plain_text(a).contains('a'));
@@ -4354,7 +4856,7 @@ mod tests {
         let b = parse_markdown_blocks(md);
         assert!(
             b.iter()
-                .any(|x| matches!(x, MarkdownBlock::ThematicBreak(_))),
+                .any(|x| matches!(x, MarkdownBlock::ThematicBreak { .. })),
             "{b:?}"
         );
     }
@@ -4366,21 +4868,101 @@ mod tests {
         assert!(
             blocks
                 .iter()
-                .any(|block| matches!(block, MarkdownBlock::Spacer { lines } if *lines >= 1)),
+                .any(|block| matches!(block, MarkdownBlock::Spacer { lines, .. } if *lines >= 1)),
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn blank_lines_after_thematic_break_before_heading_emit_spacer() {
+        let md = "---\n  \n \n\n## 1. 見出し\n";
+        let blocks = parse_markdown_blocks(md);
+        let spacer = blocks.iter().find_map(|block| match block {
+            MarkdownBlock::Spacer { lines, source } => Some((*lines, *source)),
+            _ => None,
+        });
+        assert!(
+            spacer.map(|(lines, _)| lines >= 3).unwrap_or(false),
+            "expected blank lines after --- before heading, got {blocks:?}"
+        );
+        let order: Vec<_> = blocks
+            .iter()
+            .map(|block| match block {
+                MarkdownBlock::ThematicBreak { .. } => "hr",
+                MarkdownBlock::Spacer { .. } => "spacer",
+                MarkdownBlock::Heading { .. } => "heading",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["hr", "spacer", "heading"],
+            "{blocks:?}"
+        );
+    }
+
+    #[test]
+    fn blank_lines_between_list_items_emit_spacer() {
+        let md = "- first item\n\n\n- second item\n";
+        let blocks = parse_markdown_blocks(md);
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                MarkdownBlock::Spacer { lines, .. } if *lines >= 2
+            )),
+            "{blocks:?}"
+        );
+        let order: Vec<_> = blocks
+            .iter()
+            .map(|block| match block {
+                MarkdownBlock::ListItem { spans, .. } => plain_text(spans),
+                MarkdownBlock::Spacer { .. } => "<spacer>".to_string(),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["first item", "<spacer>", "second item"],
             "{blocks:?}"
         );
     }
 
     #[test]
     fn spacer_block_clamps_excess_blank_lines() {
-        let md = "first paragraph\n\n\n\n\n\nsecond paragraph\n";
-        let blocks = parse_markdown_blocks(md);
+        let moderate = "first paragraph\n\n\n\n\n\nsecond paragraph\n";
+        let blocks = parse_markdown_blocks(moderate);
         let spacer_lines = blocks.iter().find_map(|block| match block {
-            MarkdownBlock::Spacer { lines } => Some(*lines),
+            MarkdownBlock::Spacer { lines, .. } => Some(*lines),
             _ => None,
         });
+        assert_eq!(spacer_lines, Some(5), "{blocks:?}");
 
-        assert_eq!(spacer_lines, Some(2), "{blocks:?}");
+        let mut huge = String::from("first paragraph\n");
+        huge.extend(std::iter::repeat_n('\n', 60));
+        huge.push_str("second paragraph\n");
+        let blocks = parse_markdown_blocks(&huge);
+        let spacer_lines = blocks.iter().find_map(|block| match block {
+            MarkdownBlock::Spacer { lines, .. } => Some(*lines),
+            _ => None,
+        });
+        assert_eq!(spacer_lines, Some(MAX_SPACER_LINES), "{blocks:?}");
+    }
+
+    #[tokio::test]
+    async fn moderate_blank_lines_can_push_following_block_to_next_page() {
+        let mut lines = vec!["# Section".to_string(), String::new()];
+        lines.extend(std::iter::repeat_n(String::new(), MAX_SPACER_LINES));
+        lines.push("Target paragraph that should move down.".to_string());
+        let md = lines.join("\n");
+        let blocks = parse_markdown_blocks(&md);
+        let line_count = md.lines().count();
+        let (_bytes, line_page_map) = preview_layout(line_count, &blocks);
+        assert!(
+            line_page_map[line_page_map.len() - 1] > line_page_map[0],
+            "expected trailing content after many blank lines to map to a later page, head={}, tail={}",
+            line_page_map[0],
+            line_page_map[line_page_map.len() - 1]
+        );
     }
 
     #[test]
@@ -4395,7 +4977,7 @@ mod tests {
         assert!(
             blocks.iter().any(|block| matches!(
                 block,
-                MarkdownBlock::Heading { level: 2, spans }
+                MarkdownBlock::Heading { level: 2, spans, .. }
                     if plain_text(spans).contains("after")
             )),
             "{blocks:?}"
@@ -4440,7 +5022,7 @@ mod tests {
         };
 
         match &blocks[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 assert!(spans.iter().any(|s| s.style.link), "{spans:?}");
                 assert!(
                     spans
@@ -4460,7 +5042,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 assert!(spans.iter().any(|s| s.style.math), "{spans:?}");
                 let text = plain_text(spans);
                 assert!(text.contains("E = mc^2"), "{text}");
@@ -4579,7 +5161,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 assert!(
                     spans
                         .iter()
@@ -4733,8 +5315,8 @@ mod tests {
             },
         }];
 
-        let plain_height = estimate_rich_block_height(&plain, 90, 11.5);
-        let math_height = estimate_rich_block_height(&math, 90, 11.5);
+        let plain_height = estimate_rich_line_height(&plain, 11.5);
+        let math_height = estimate_rich_line_height(&math, 11.5);
         assert!(
             math_height > plain_height,
             "plain_height={plain_height}, math_height={math_height}"
@@ -4764,7 +5346,7 @@ mod tests {
         assert_eq!(blocks.len(), 3, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Paragraph(spans) => {
+            MarkdownBlock::Paragraph { spans, .. } => {
                 let text = plain_text(spans);
                 assert!(text.contains("これは"), "{text}");
                 assert!(spans.iter().any(|s| s.style.code), "{spans:?}");
@@ -4773,12 +5355,12 @@ mod tests {
         }
 
         assert!(
-            matches!(&blocks[1], MarkdownBlock::Spacer { lines: 1 }),
+            matches!(&blocks[1], MarkdownBlock::Spacer { lines: 1, .. }),
             "{blocks:?}"
         );
 
         match &blocks[2] {
-            MarkdownBlock::DisplayMath(expr) => {
+            MarkdownBlock::DisplayMath { expr, .. } => {
                 assert!(expr.contains("E = mc^2"), "{expr}");
             }
             other => panic!("unexpected block: {other:?}"),
@@ -4790,11 +5372,11 @@ mod tests {
         let blocks = parse_markdown_blocks("$$\nE = mc^2\n$$\n");
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(
-            matches!(&blocks[0], MarkdownBlock::DisplayMath(_)),
+            matches!(&blocks[0], MarkdownBlock::DisplayMath { .. }),
             "{blocks:?}"
         );
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let pdf_text = String::from_utf8_lossy(&bytes);
         assert!(
             pdf_text.contains("/DCTDecode"),
@@ -4821,11 +5403,11 @@ mod tests {
         let blocks = parse_markdown_blocks("\\[\nE = mc^2\n\\]\n");
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(
-            matches!(&blocks[0], MarkdownBlock::DisplayMath(expr) if expr.contains("E = mc^2")),
+            matches!(&blocks[0], MarkdownBlock::DisplayMath { expr, .. } if expr.contains("E = mc^2")),
             "{blocks:?}"
         );
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("bracket-display-math.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -4852,7 +5434,7 @@ mod tests {
         let blocks = parse_markdown_blocks("1. first\n2. second\n");
         assert_eq!(blocks.len(), 2, "{blocks:?}");
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("ordered-list.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -4916,7 +5498,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 assert!(
                     lines.len() > 1,
                     "expected long blockquote text to wrap into multiple lines: {lines:?}"
@@ -4933,7 +5515,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 let text = blockquote_plain_text(lines);
                 assert!(text.contains("one"), "{text}");
                 assert!(text.contains("two"), "{text}");
@@ -4950,7 +5532,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 let text = blockquote_plain_text(lines);
                 assert!(text.contains("Level 1"), "{text}");
                 assert!(text.contains("Level 2"), "{text}");
@@ -4970,11 +5552,11 @@ mod tests {
         let blocks = parse_markdown_blocks(&md);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(
-            matches!(&blocks[0], MarkdownBlock::Blockquote(_)),
+            matches!(&blocks[0], MarkdownBlock::Blockquote { .. }),
             "{blocks:?}"
         );
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("long-blockquote.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -5032,7 +5614,7 @@ mod tests {
         let blocks = parse_markdown_blocks(md);
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         match &blocks[0] {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 assert!(
                     lines.iter().any(|line| matches!(
                         line,
@@ -5044,7 +5626,7 @@ mod tests {
             other => panic!("unexpected block: {other:?}"),
         }
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("blockquote-code-block.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
@@ -5079,7 +5661,7 @@ mod tests {
         let blocks = parse_markdown_blocks(&md);
         assert!(!blocks.is_empty(), "{blocks:?}");
 
-        let bytes = build_preview_pdf(&blocks).expect("preview PDF should be generated");
+        let bytes = preview_pdf_bytes(&blocks);
         let pdf_path = std::env::temp_dir().join("minipdf-emoji-preview.pdf");
         std::fs::write(&pdf_path, bytes).expect("preview PDF should be written");
         let loaded = crate::commands::pdf_loader::load_pdf(pdf_path.to_string_lossy().to_string())
@@ -5130,7 +5712,7 @@ mod tests {
         assert!(
             blocks
                 .iter()
-                .all(|block| matches!(block, MarkdownBlock::ThematicBreak(_))),
+                .all(|block| matches!(block, MarkdownBlock::ThematicBreak { .. })),
             "{blocks:?}"
         );
 
@@ -5147,7 +5729,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "{blocks:?}");
 
         match &blocks[0] {
-            MarkdownBlock::Blockquote(lines) => {
+            MarkdownBlock::Blockquote { lines, .. } => {
                 assert!(
                     lines.iter().any(|line| matches!(line, BlockquoteLine::DisplayMath(expr) if expr.contains("x = y + z"))),
                     "{lines:?}"
@@ -5207,10 +5789,13 @@ mod tests {
 
     #[test]
     fn html_preview_includes_print_page_rules() {
-        let html = build_preview_html(&[MarkdownBlock::Paragraph(vec![InlineSpan {
-            text: "hello".to_string(),
-            style: TextStyle::default(),
-        }])]);
+        let html = build_preview_html(&[MarkdownBlock::Paragraph {
+            spans: vec![InlineSpan {
+                text: "hello".to_string(),
+                style: TextStyle::default(),
+            }],
+            source: BlockSource::single(1),
+        }]);
         assert!(html.contains("@page { size: A4; margin: 0; }"), "{html}");
         assert!(html.contains("break-after: page"), "{html}");
         assert!(html.contains("page-break-after: always"), "{html}");
@@ -5218,10 +5803,13 @@ mod tests {
 
     #[test]
     fn html_preview_constrains_mermaid_images_and_fallbacks() {
-        let html = build_preview_html(&[MarkdownBlock::Paragraph(vec![InlineSpan {
-            text: "hello".to_string(),
-            style: TextStyle::default(),
-        }])]);
+        let html = build_preview_html(&[MarkdownBlock::Paragraph {
+            spans: vec![InlineSpan {
+                text: "hello".to_string(),
+                style: TextStyle::default(),
+            }],
+            source: BlockSource::single(1),
+        }]);
 
         assert!(html.contains(".mermaid-frame"), "{html}");
         assert!(html.contains("max-height: 260pt"), "{html}");
@@ -5277,11 +5865,11 @@ mod tests {
 
     #[tokio::test]
     async fn mermaid_preview_pdf_does_not_emit_smask() {
-        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+        let bytes = preview_pdf_bytes(&[MarkdownBlock::CodeBlock {
             lang: "mermaid".to_string(),
             code: "flowchart LR\n  A-->B\n".to_string(),
-        }])
-        .expect("preview PDF should be generated");
+            source: BlockSource::single(1),
+        }]);
 
         assert!(
             !bytes.windows(7).any(|w| w == b"/SMask "),
@@ -5323,13 +5911,36 @@ mod tests {
     #[test]
     fn list_item_content_x_increases_with_prefix_width() {
         let font = Font::Helvetica;
-        let shallow = list_item_content_x("• ", &font, 11.0);
-        let nested = list_item_content_x("  • ", &font, 11.0);
-        let ordered = list_item_content_x("12. ", &font, 11.0);
+        let shallow = list_item_content_x(0, "•", &font, 11.0);
+        let nested = list_item_content_x(1, "•", &font, 11.0);
+        let ordered = list_item_content_x(0, "12.", &font, 11.0);
 
         assert!(shallow > MARGIN + 4.0, "shallow={shallow}");
         assert!(nested > shallow, "nested={nested}, shallow={shallow}");
         assert!(ordered >= shallow, "ordered={ordered}, shallow={shallow}");
+    }
+
+    #[test]
+    fn nested_list_indent_uses_fixed_step_instead_of_literal_spaces() {
+        let font = Font::Helvetica;
+        let top_marker = list_marker_x(0);
+        let nested_marker = list_marker_x(1);
+        let deep_marker = list_marker_x(2);
+        let top_text = list_item_content_x(0, "•", &font, 11.0);
+        let nested_text = list_item_content_x(1, "•", &font, 11.0);
+
+        assert!(
+            (nested_marker - top_marker - LIST_INDENT_STEP_PT).abs() < f64::EPSILON,
+            "top={top_marker}, nested={nested_marker}"
+        );
+        assert!(
+            (deep_marker - nested_marker - LIST_INDENT_STEP_PT).abs() < f64::EPSILON,
+            "nested={nested_marker}, deep={deep_marker}"
+        );
+        assert!(
+            (nested_text - top_text - LIST_INDENT_STEP_PT).abs() < f64::EPSILON,
+            "top_text={top_text}, nested_text={nested_text}"
+        );
     }
 
     #[tokio::test]
@@ -5338,11 +5949,11 @@ mod tests {
             .map(|i| format!("line-{i:03}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+        let bytes = preview_pdf_bytes(&[MarkdownBlock::CodeBlock {
             lang: "text".to_string(),
             code,
-        }])
-        .expect("preview PDF should be generated");
+            source: BlockSource { start_line: 1, end_line: 120 },
+        }]);
 
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("oversized-code-block.pdf");
@@ -5365,11 +5976,14 @@ mod tests {
             .map(|i| format!("line-{i:03}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let bytes = build_preview_pdf(&[MarkdownBlock::CodeBlock {
+        let bytes = preview_pdf_bytes(&[MarkdownBlock::CodeBlock {
             lang: "text".to_string(),
             code,
-        }])
-        .expect("preview PDF should be generated");
+            source: BlockSource {
+                start_line: 1,
+                end_line: 260,
+            },
+        }]);
 
         let temp_dir = tempfile::tempdir().expect("temp dir should be created");
         let pdf_path = temp_dir.path().join("long-code-block.pdf");

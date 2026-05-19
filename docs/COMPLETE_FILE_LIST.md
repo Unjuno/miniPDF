@@ -3,12 +3,12 @@
 この文書は、miniPDFプロジェクトのすべてのファイルを網羅的にリストアップしたものです。
 
 **最終更新**: 2026年（`PageEditor` 撤去・プレビュー専用 UI 反映）
-**総ファイル数**: 175ファイル（node_modules、target、dist、.gitを除く）
+**総ファイル数**: 179ファイル（node_modules、target、dist、.gitを除く）
 
 ## ファイル統計
 
-- **Markdownファイル**: 25ファイル
-- **TypeScript/TSXファイル**: 36ファイル
+- **Markdownファイル**: 28ファイル
+- **TypeScript/TSXファイル**: 37ファイル
 - **Rustファイル**: 21ファイル
 - **CSSファイル**: 13ファイル
 - **JSONファイル**: 12ファイル
@@ -62,11 +62,14 @@
 - `FILE_LIST.md` - プロジェクトファイルリスト（構造説明）
 - `COMPLETE_FILE_LIST.md` - 完全ファイルリスト（このファイル）
 
-### バグノート（docs/bugs/ - 7ファイル）
+### バグノート（docs/bugs/ - 10ファイル）
 - `page-delete-render-mismatch.md` - ページ削除時のレンダリング不一致
 - `page-reorder-dnd.md` - ページ並び替えのドラッグアンドドロップ
 - `preview-blank-page-render.md` - プレビューの空白ページレンダリング
 - `preview-reorder-not-updating.md` - プレビューの並び替え更新
+- `20260519-markdown-preview-sync-debounce.md` - Markdown プレビューの同期遅延とページ内追従
+- `20260519-markdown-preview-sync-memo-comparator.md` - Markdown プレビュー同期の memo 比較漏れ
+- `20260519-markdown-preview-single-page-scroll-raf.md` - Markdown プレビュー単一ページのスクロール更新タイミング
 - `20260519-thematic-break-style-variants.md` - 水平線の記法ごとの差分レンダリング
 - `readme-missing-links.md` - READMEのリンク不足
 - `zoom-minus-button.md` - ズームマイナスボタン
@@ -95,11 +98,12 @@
   - `PDFViewer.css`, `TextEditor.css`, `Toast.css`, `KeyboardShortcutsHelp.css`
 - **注**: `App.tsx`と`App.css`は`src/`ディレクトリにあります
 
-### フック（src/hooks/ - 6ファイル）
+### フック（src/hooks/ - 7ファイル）
 - `useDebounce.ts` - デバウンスフック
 - `useDragMove.ts` - ドラッグ移動フック
 - `useDragResize.ts` - ドラッグリサイズフック
 - `useKeyboardShortcuts.ts` - キーボードショートカットフック
+- `useSinglePagePreviewScrollSync.ts` - 単一ページプレビューのスクロール同期フック
 - `useRenderCache.ts` - レンダリングキャッシュフック
 - `useToast.ts` - トースト通知フック
 
@@ -231,9 +235,9 @@
 - **CSS**: 13ファイル
 
 ### ドキュメント
-- **Markdown**: 23ファイル
+- **Markdown**: 28ファイル
   - ルート: 2ファイル（README.md, AGENTS.md）
-  - docs/: 22ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート6ファイル）
+  - docs/: 24ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート10ファイル）
   - .playwright-mcp/: 1ファイル（ui-test-snapshot.md）
 
 ### 設定ファイル

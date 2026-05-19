@@ -8,6 +8,11 @@ import { isTauriRuntimeAvailable } from '../utils/tauriRuntime';
 
 type PageProcessingError = { type: 'imageExtraction' | 'textExtraction' | 'unexpected'; pageNumber: number };
 
+export interface MarkdownPreviewResult {
+  filePath: string;
+  linePageMap: number[];
+}
+
 interface PdfStore {
   pdfStructure: PdfStructure | null;
   selectedImageId: string | null;
@@ -20,6 +25,7 @@ interface PdfStore {
   previewError: string | null;
   previewPdfPath: string | null;
   previewHtml: string | null;
+  previewLinePageMap: number[] | null;
   previewRequestId: number;
   isLoading: boolean; // why: PDF読み込み中のフラグ（競合状態を防ぐ）
   // alt: フラグなし（読み込み中に他の操作が実行される可能性がある）
@@ -69,6 +75,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
   previewError: null,
   previewPdfPath: null,
   previewHtml: null,
+  previewLinePageMap: null,
   previewRequestId: 0,
   isLoading: false,
   isEditing: false,
@@ -1312,6 +1319,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           previewError: 'ブラウザモードではPDFライブプレビューは利用できません。tauri:dev で確認してください。',
           previewPdfPath: null,
           previewHtml: null,
+          previewLinePageMap: null,
           previewRequestId: requestId,
         });
         return null;
@@ -1322,6 +1330,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
           previewError: null,
           previewPdfPath: null,
           previewHtml: null,
+          previewLinePageMap: null,
           previewRequestId: requestId,
         });
         return null;
@@ -1331,7 +1340,9 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
         previewError: null,
         previewRequestId: requestId,
       });
-      const filePath = await invoke<string>('render_markdown_to_pdf_preview', { markdown });
+      const preview = await invoke<MarkdownPreviewResult>('render_markdown_to_pdf_preview', {
+        markdown,
+      });
       const current = get();
       if (current.previewRequestId !== requestId) {
         return null;
@@ -1339,10 +1350,11 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
       set({
         isPreviewBuilding: false,
         previewError: null,
-        previewPdfPath: filePath,
+        previewPdfPath: preview.filePath,
         previewHtml: null,
+        previewLinePageMap: preview.linePageMap,
       });
-      return filePath;
+      return preview.filePath;
     } catch (error) {
       const current = get();
       if (current.previewRequestId !== requestId) {
@@ -1353,6 +1365,7 @@ export const usePdfStore = create<PdfStore>((set, get) => ({
         isPreviewBuilding: false,
         previewError: message,
         previewHtml: null,
+        previewLinePageMap: null,
       });
       throw error;
     }

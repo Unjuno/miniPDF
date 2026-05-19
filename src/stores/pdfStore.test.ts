@@ -621,7 +621,10 @@ describe('pdfStore', () => {
     const mockedInvoke = invoke as unknown as Mock;
     const tauriWindow = globalThis.window as Window & { __TAURI__?: unknown; __TAURI_INTERNALS__?: unknown };
     tauriWindow.__TAURI__ = {};
-    mockedInvoke.mockResolvedValue('C:/temp/preview.pdf');
+    mockedInvoke.mockResolvedValue({
+      filePath: 'C:/temp/preview.pdf',
+      linePageMap: [1, 1, 2],
+    });
 
     const result = await usePdfStore.getState().requestMarkdownPreview('# ok', 2);
 
@@ -631,6 +634,7 @@ describe('pdfStore', () => {
       markdown: '# ok',
     });
     expect(usePdfStore.getState().previewPdfPath).toBe('C:/temp/preview.pdf');
+    expect(usePdfStore.getState().previewLinePageMap).toEqual([1, 1, 2]);
     expect(usePdfStore.getState().previewHtml).toBeNull();
     expect(usePdfStore.getState().previewError).toBeNull();
 

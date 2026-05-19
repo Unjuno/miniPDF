@@ -68,6 +68,8 @@ miniPDF/
 - `page-reorder-dnd.md` - ページ並び替えのドラッグアンドドロップ
 - `preview-blank-page-render.md` - プレビューの空白ページレンダリング
 - `preview-reorder-not-updating.md` - プレビューの並び替え更新
+- `20260519-markdown-preview-sync-debounce.md` - Markdown プレビューの同期遅延とページ内追従
+- `20260519-markdown-preview-single-page-scroll-raf.md` - Markdown プレビュー単一ページのスクロール更新タイミング
 - `20260519-thematic-break-style-variants.md` - 水平線の記法ごとの差分レンダリング
 - `readme-missing-links.md` - READMEのリンク不足
 - `zoom-minus-button.md` - ズームマイナスボタン
@@ -101,6 +103,7 @@ miniPDF/
 - `useDragMove.ts` - ドラッグ移動フック
 - `useDragResize.ts` - ドラッグリサイズフック
 - `useKeyboardShortcuts.ts` - キーボードショートカットフック
+- `useSinglePagePreviewScrollSync.ts` - 単一ページプレビューのスクロール同期フック
 - `useRenderCache.ts` - レンダリングキャッシュフック
 - `useToast.ts` - トースト通知フック
 
@@ -234,18 +237,18 @@ miniPDF/
 
 ### ドキュメント
 
-- Markdownファイル: 25ファイル
+- Markdownファイル: 28ファイル
   - ルート: 2ファイル（README.md, AGENTS.md）
-  - docs/: 23ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート6ファイル）
+  - docs/: 24ファイル（INDEX.md, CONCEPT.md, SPECIFICATION.md, FEATURES.md, DO_NOT.md, IMPLEMENTATION_PLAN.md, IMPLEMENTATION_VERIFICATION.md, ACTUAL_IMPLEMENTATION_STATUS.md, PDF_LIBRARY_RESEARCH.md, OXIDIZE_PDF_MIGRATION_PLAN.md, CARGO_PROFILE_ANALYSIS.md, FONT_MANAGEMENT.md, markdown-preview-cli.md, FILE_LIST.md, COMPLETE_FILE_LIST.md, RELEASING.md, バグノート10ファイル）
   - .playwright-mcp/: 1ファイル（ui-test-snapshot.md）
   - src-tauri/fonts/: 1ファイル（README.md）
-- バグノート: 7ファイル（docs/bugs/）
+- バグノート: 10ファイル（docs/bugs/）
 
 ### ソースコード
 
-- TypeScript/TSXファイル: 36ファイル
+- TypeScript/TSXファイル: 37ファイル
   - コンポーネント: 16ファイル（.tsx, .ts）- `src/components/`内（テストファイル含む）
-  - フック: 6ファイル（.ts）
+  - フック: 7ファイル（.ts）
   - ストア: 2ファイル（.ts）
   - ユーティリティ: 7ファイル（.ts）
   - 型定義: 1ファイル（.ts）

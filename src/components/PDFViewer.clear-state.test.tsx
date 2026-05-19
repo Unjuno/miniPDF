@@ -245,4 +245,77 @@ describe('PDFViewer clears state when pdfStructure is cleared', () => {
     expect(screen.queryByRole('button', { name: '新しい画像を挿入' })).toBeNull();
     expect(screen.queryByText(/テキスト:/)).toBeNull();
   });
+
+  it('scrolls the single-page preview when the cursor line changes', async () => {
+    vi.mocked(readFile).mockResolvedValue(new Uint8Array([1, 2, 3]));
+
+    const getViewport = vi.fn(({ scale = 1 }) => ({
+      width: 595 * scale,
+      height: 842 * scale,
+    }));
+    const renderMock = vi.fn(() => ({ promise: Promise.resolve() }));
+    const getPage = vi.fn(async () => ({
+      getViewport,
+      render: renderMock,
+    }));
+
+    vi.mocked((await import('pdfjs-dist')).getDocument).mockReturnValue({
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage,
+        destroy: vi.fn(),
+      }),
+      destroy: vi.fn(() => Promise.resolve()),
+    } as unknown as ReturnType<typeof import('pdfjs-dist')['getDocument']>);
+
+    HTMLCanvasElement.prototype.getContext = vi.fn(() => null);
+
+    const pdfStructure = {
+      filePath: 'preview.pdf',
+      metadata: {},
+      pages: [
+        {
+          pageNumber: 1,
+          sourcePageNumber: 1,
+          width: 595,
+          height: 842,
+          images: [],
+          textBlocks: [],
+        },
+      ],
+    };
+
+    usePdfStore.setState({
+      markdownText: [
+        'afaga',
+        'adada',
+        'afasa',
+        'adaf',
+        '# fsga',
+        '---',
+        '',
+        'adada',
+      ].join('\n'),
+    });
+
+    const { container, rerender } = render(
+      <PDFViewer pdfStructure={pdfStructure} zoomLevel={1} previewOnly editorCursorLine={1} />
+    );
+
+    const canvasContainer = container.querySelector('.pdf-viewer-canvas-container') as HTMLElement;
+    Object.defineProperty(canvasContainer, 'clientHeight', { configurable: true, value: 800 });
+    Object.defineProperty(canvasContainer, 'scrollHeight', { configurable: true, value: 1600 });
+    Object.defineProperty(canvasContainer, 'scrollTop', { configurable: true, writable: true, value: 0 });
+
+    const pdfjs = await import('pdfjs-dist');
+    await waitFor(() => {
+      expect(vi.mocked(pdfjs.getDocument)).toHaveBeenCalled();
+    });
+
+    rerender(<PDFViewer pdfStructure={pdfStructure} zoomLevel={1} previewOnly editorCursorLine={12} />);
+
+    await waitFor(() => {
+      expect(canvasContainer.scrollTop).toBeGreaterThan(0);
+    });
+  });
 });

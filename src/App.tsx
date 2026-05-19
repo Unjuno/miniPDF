@@ -12,7 +12,7 @@ import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { logger } from './utils/logger';
 import { isMarkdownFilePath } from './utils/markdownFile';
 import { isTauriRuntimeAvailable } from './utils/tauriRuntime';
-import { estimatePreviewPageFromMarkdown, getLineNumberFromOffset } from './utils/markdownPositionSync';
+import { getLineNumberFromOffset, resolvePreviewPageFromMarkdown } from './utils/markdownPositionSync';
 import {
   insertMarkdownHardBreak,
   restoreTextareaCursor,
@@ -31,11 +31,12 @@ function App() {
   const loadPdf = usePdfStore((state) => state.loadPdf);
   const savePdf = usePdfStore((state) => state.savePdf);
   const markdownText = usePdfStore((state) => state.markdownText);
-  const isPreviewBuilding = usePdfStore((state) => state.isPreviewBuilding);
   const previewError = usePdfStore((state) => state.previewError);
   const currentPage = usePdfStore((state) => state.currentPage);
   const setMarkdownText = usePdfStore((state) => state.setMarkdownText);
   const requestMarkdownPreview = usePdfStore((state) => state.requestMarkdownPreview);
+  const previewLinePageMap = usePdfStore((state) => state.previewLinePageMap);
+  const isPreviewBuilding = usePdfStore((state) => state.isPreviewBuilding);
   const setCurrentPage = usePdfStore((state) => state.setCurrentPage);
   const setZoomLevel = usePdfStore((state) => state.setZoomLevel);
   const clearError = usePdfStore((state) => state.clearError);
@@ -45,13 +46,12 @@ function App() {
   // alt: ローカルのisLoading stateを使用（状態の重複と不整合の可能性）
   // evidence: pdfStoreのisLoadingを使用することで、状態の一貫性を保つ
   const isLoading = usePdfStore((state) => state.isLoading);
-  const debouncedMarkdown = useDebounce(markdownText, 450);
+  const debouncedMarkdown = useDebounce(markdownText, 150);
   const [editorCursorLine, setEditorCursorLine] = useState(1);
   const previewRequestIdRef = useRef(0);
   const markdownEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const pendingCursorOffsetRef = useRef<number | null>(null);
   const currentPageRef = useRef(currentPage);
-  const debouncedCursorLine = useDebounce(editorCursorLine, 120);
 
   const syncEditorCursor = useCallback((text: string, cursorOffset: number) => {
     const lineNumber = getLineNumberFromOffset(text, cursorOffset);
@@ -143,16 +143,30 @@ function App() {
   }, [currentPage]);
 
   useEffect(() => {
-    if (!pdfStructure?.pages?.length) return;
-    const targetPage = estimatePreviewPageFromMarkdown(
-      markdownText,
-      debouncedCursorLine,
-      pdfStructure.pages.length
+    if (!pdfStructure?.pages?.length || isPreviewBuilding) return;
+    const syncMarkdown = debouncedMarkdown;
+    const syncLineCount = syncMarkdown.split(/\r?\n/).length;
+    if (previewLinePageMap && previewLinePageMap.length !== syncLineCount) {
+      return;
+    }
+    const cursorLine = Math.min(editorCursorLine, syncLineCount);
+    const targetPage = resolvePreviewPageFromMarkdown(
+      syncMarkdown,
+      cursorLine,
+      pdfStructure.pages.length,
+      previewLinePageMap
     );
     if (targetPage !== currentPageRef.current) {
       setCurrentPage(targetPage);
     }
-  }, [debouncedCursorLine, markdownText, pdfStructure?.pages?.length, setCurrentPage]);
+  }, [
+    editorCursorLine,
+    debouncedMarkdown,
+    previewLinePageMap,
+    isPreviewBuilding,
+    pdfStructure?.pages?.length,
+    setCurrentPage,
+  ]);
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -302,7 +316,14 @@ function App() {
           </div>
         )}
         <section className="preview-pane">
-          <PDFViewer pdfStructure={pdfStructure} zoomLevel={zoomLevel} previewOnly />
+          <PDFViewer
+            pdfStructure={pdfStructure}
+            zoomLevel={zoomLevel}
+            previewOnly
+            editorCursorLine={editorCursorLine}
+            previewSyncMarkdown={debouncedMarkdown}
+            previewLinePageMap={previewLinePageMap}
+          />
         </section>
         <ToastContainer toasts={toasts} onDismiss={dismissToast} />
       </main>

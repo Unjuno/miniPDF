@@ -76,4 +76,10 @@ mian.pdf
 # 個人メモ（誤字ファイル名のままローカル専用）
 reviw.md
 
+# ローカル検証用（fixtures/ は追跡対象のまま）
+tmp/
+tmp-italic.*
+src-tauri/tmp-*
+pdfjs-harness-*.png
+
 # 広すぎる *.pdf / *.exe は使わない（fixtures の PDF をコミットできるようにする）

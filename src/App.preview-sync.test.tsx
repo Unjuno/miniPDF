@@ -124,4 +124,29 @@ describe('App preview page sync', () => {
       expect(usePdfStore.getState().currentPage).toBe(2);
     });
   });
+
+  it('updates the preview page when Enter inserts a hard break across a page boundary', async () => {
+    const longMarkdown = Array.from({ length: 100 }, (_, index) => `line ${index + 1}`).join('\n');
+    // One extra slot so the map still matches after Enter adds a line (101 lines).
+    const linePageMap = Array.from({ length: 101 }, (_, index) => (index < 50 ? 1 : 2));
+    usePdfStore.setState({
+      markdownText: longMarkdown,
+      currentPage: 1,
+      previewLinePageMap: linePageMap,
+    });
+
+    render(<App />);
+
+    const editor = screen.getByPlaceholderText('# Markdownを入力してください') as HTMLTextAreaElement;
+    const lines = longMarkdown.split('\n');
+    const offsetToLine50End = lines.slice(0, 50).reduce((sum, line) => sum + line.length + 1, 0) - 1;
+    editor.setSelectionRange(offsetToLine50End, offsetToLine50End);
+
+    fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', keyCode: 13, charCode: 13 });
+
+    await waitFor(() => {
+      expect(usePdfStore.getState().markdownText.split('\n').length).toBe(101);
+      expect(screen.getByTestId('preview-page').textContent).toContain('Page 2');
+    });
+  });
 });
