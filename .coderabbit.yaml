@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "ja-JP"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  review_details: true
+  commit_status: true
+  fail_commit_status: false
+  collapse_walkthrough: true
+  changed_files_summary: true
+  poem: false
+  in_progress_fortune: false
+  enable_prompt_for_ai_agents: false
+
+  path_filters:
+    - "!node_modules/**"
+    - "!dist/**"
+    - "!build/**"
+    - "!src-tauri/target/**"
+    - "!coverage/**"
+    - "!*.log"
+    - "!*.pdf"
+
+  path_instructions:
+    - path: "src/**"
+      instructions: >
+        miniPDF is a Tauri + React + TypeScript desktop app for Markdown-to-PDF
+        preview and saving. Prioritize UI state correctness, file handling safety,
+        PDF preview/save behavior, and mismatch between docs and implementation.
+    - path: "src-tauri/**"
+      instructions: >
+        Prioritize Tauri command safety, filesystem access boundaries, path handling,
+        PDF generation correctness, Mermaid CLI invocation safety, and test coverage
+        for Rust behavior.
+    - path: ".github/workflows/**"
+      instructions: >
+        Check CI and release workflows for excessive permissions, unsafe artifact
+        handling, missing tests, and release steps that could publish unintended files.
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 5
+    ignore_title_keywords:
+      - "WIP"
+      - "Draft"
+      - "DO NOT REVIEW"
+      - "[skip review]"
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+
+chat:
+  art: false
+  auto_reply: false
